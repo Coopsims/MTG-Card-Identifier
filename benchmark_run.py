@@ -40,7 +40,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as T
-from PIL import Image
+from PIL import Image, ImageOps
 from tqdm import tqdm
 
 from mtg_layout import (
@@ -104,12 +104,12 @@ class FrameClassifier(nn.Module):
 class MobileNetReranker(nn.Module):
     def __init__(self, embedding_dim: int = EMBEDDING_DIM):
         super().__init__()
-        backbone = models.mobilenet_v3_small(
-            weights=models.MobileNet_V3_Small_Weights.DEFAULT)
+        backbone = models.mobilenet_v3_large(
+            weights=models.MobileNet_V3_Large_Weights.DEFAULT)
         self.features = backbone.features
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.projection = nn.Sequential(
-            nn.Linear(576, 512),
+            nn.Linear(960, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
@@ -274,12 +274,12 @@ class MultiRegionPipeline:
         return [self.set_codes[i] for i in top if i < len(self.set_codes)]
 
     def identify(self, image_path: str, top_k: int = 5,
-                 hash_candidates: int = 100):
+                 hash_candidates: int = 500):
         timings: Dict[str, float] = {}
 
         # Stage 1: load + detect
         t0 = time.perf_counter()
-        img = np.array(Image.open(image_path).convert('RGB'))
+        img = np.array(ImageOps.exif_transpose(Image.open(image_path)).convert('RGB'))
         card_img, route = self.detector.detect_and_correct(img)
         timings['detect_ms'] = (time.perf_counter() - t0) * 1000
 
@@ -308,6 +308,30 @@ class MultiRegionPipeline:
         d_p = hamming_distance_vectorized(q_p, db_p)
         d_d = hamming_distance_vectorized(q_d, db_d)
         combined = d_p + d_d
+
+        # Test-time augmentation: if top-1 distance is poor, try rotations
+        best_distance = combined.min()
+        if best_distance > 10:
+            for angle in [90, 180, 270]:
+                rotated_img = np.rot90(card_img, k=angle // 90)
+                if frame_class == 'modern':
+                    rot_region = extract_art_crop(rotated_img)
+                else:
+                    rot_region = extract_whole_card(rotated_img)
+
+                rot_p = phash_64(rot_region)
+                rot_d = dhash_64(rot_region)
+                rot_d_p = hamming_distance_vectorized(rot_p, db_p)
+                rot_d_d = hamming_distance_vectorized(rot_d, db_d)
+                rot_combined = rot_d_p + rot_d_d
+                rot_min = rot_combined.min()
+
+                if rot_min < best_distance:
+                    best_distance = rot_min
+                    combined = rot_combined
+                    region = rot_region
+                    card_img = rotated_img
+
         k = min(hash_candidates, len(combined) - 1)
         cand_pos = np.argpartition(combined, k)[:hash_candidates]
         cand_pos = cand_pos[np.argsort(combined[cand_pos])]
@@ -560,7 +584,7 @@ def build_test_set(cards, available, frame_classes_by_id,
                                                desc=f"  {difficulty}/{frame_cls}")):
                 card = cards[card_idx]
                 src = IMAGE_DIR / f"{card['id']}.jpg"
-                card_img = np.array(Image.open(src).convert('RGB'))
+                card_img = np.array(ImageOps.exif_transpose(Image.open(src)).convert('RGB'))
                 if card_img.shape[0] != CARD_H or card_img.shape[1] != CARD_W:
                     card_img = cv2.resize(card_img, (CARD_W, CARD_H))
                 scene = synthesize_photo(card_img, difficulty=difficulty)
