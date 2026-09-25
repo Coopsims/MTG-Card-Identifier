@@ -38,33 +38,45 @@ def glare_mask(card_rgb: np.ndarray, min_blob_frac: float = 0.0004,
     """
     Binary mask (uint8 0/255) of specular highlights on a rectified card.
 
-    A pixel is glare when it is bright, weakly saturated AND noticeably
-    brighter than its neighbourhood. The last condition keeps legitimately
-    white regions (white borders, pale text boxes, snowy art) out of the
-    mask, since those are bright but not brighter than their surroundings
-    across a large window. Nearly blown-out pixels are always glare.
+    Hysteresis, like Canny: glare almost always has a clipped core (nearly
+    pure white, no colour), so those pixels seed the mask, which then grows
+    into the connected halo of bright, weakly saturated pixels that stand out
+    from their surroundings. Pale regions without a clipped core - white
+    borders, text boxes, snowy art - are left alone even though they are
+    bright and unsaturated; inpainting them would erase real content.
     """
     hsv = cv2.cvtColor(card_rgb, cv2.COLOR_RGB2HSV)
-    s = hsv[:, :, 1].astype(np.int16)
-    v = hsv[:, :, 2].astype(np.int16)
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
     h, w = v.shape
-    k = max(15, (min(h, w) // 10) | 1)
-    # Local background brightness: morphological opening removes bright
-    # structures smaller than the kernel (i.e. glare spots and streaks)
-    bg = cv2.morphologyEx(v.astype(np.uint8), cv2.MORPH_OPEN,
-                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))).astype(np.int16)
-    bg = cv2.blur(bg.astype(np.uint8), (k, k)).astype(np.int16)
-    tophat = v - bg
-    blown = (v >= 250) & (s < 40)
-    specular = (v >= 190) & (s < 70) & (tophat > 35)
-    mask = (blown | specular).astype(np.uint8) * 255
+    seeds = (v >= 248) & (s < 50)
+    if not seeds.any():
+        return np.zeros((h, w), np.uint8)
 
-    # Drop speckle, keep real highlights
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    # Local surface brightness, robust to thin dark strokes (text): close
+    # small dark gaps first, then open away bright structures smaller than
+    # the kernel (glare spots / streaks).
+    k = max(15, (min(h, w) // 6) | 1)
+    surface = cv2.morphologyEx(v, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)))
+    surface = cv2.morphologyEx(surface, cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    surface = cv2.blur(surface, (k, k))
+    tophat = v.astype(np.int16) - surface.astype(np.int16)
+    halo = (v >= 190) & (s < 80) & (tophat > 20)
+    # A halo only extends a limited distance from its core; beyond that a
+    # bright region is more likely pale card content next to the glare.
+    r = max(6, int(0.04 * min(h, w)))
+    near = cv2.dilate(seeds.astype(np.uint8), cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))) > 0
+    candidates = ((halo & near) | seeds).astype(np.uint8)
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(candidates, 8)
+    seeded = np.zeros(n, bool)
+    seeded[np.unique(labels[seeds])] = True
+    seeded[0] = False
     min_px = max(4, int(min_blob_frac * h * w))
-    keep = np.zeros(n, bool)
-    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_px
-    mask = (keep[labels] * 255).astype(np.uint8)
+    seeded &= stats[:, cv2.CC_STAT_AREA] >= min_px
+    mask = (seeded[labels] * 255).astype(np.uint8)
     if dilate_px > 0 and mask.any():
         mask = cv2.dilate(mask, cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * dilate_px + 1, 2 * dilate_px + 1)))
@@ -74,31 +86,38 @@ def glare_mask(card_rgb: np.ndarray, min_blob_frac: float = 0.0004,
 def remove_glare(card_rgb: np.ndarray, mask: Optional[np.ndarray] = None,
                  max_frac: float = 0.35) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Inpaint specular highlights. Returns (clean_image, mask).
+    Inpaint specular highlights. Returns (clean_image, mask), where mask is
+    the full glare mask (core + halo) for the verifier to ignore.
 
-    Inpainting can't recover what's under the glare, but it replaces a
-    saturated white blob with plausible surrounding colour, which moves
-    pHash / embeddings back toward the reference. If more than max_frac of
-    the card is masked we inpaint only the blown-out core, since smearing
-    half the card is worse than leaving it.
+    Only the washed-out core is inpainted: there the underlying card is
+    gone, and a flat white blob drags pHash / embeddings away from the
+    reference. The halo still shows the card through a veil, so it's kept
+    (inpainting would replace real content with guesses) and merely masked
+    out of the verification. If the core covers more than max_frac of the
+    card, only its clipped centre is filled - smearing half a card is worse
+    than leaving it.
     """
     if mask is None:
         mask = glare_mask(card_rgb)
-    frac = float((mask > 0).mean())
-    if frac == 0:
+    if not mask.any():
         return card_rgb, mask
-    if frac > max_frac:
-        v = cv2.cvtColor(card_rgb, cv2.COLOR_RGB2HSV)[:, :, 2]
-        mask = ((v >= 250).astype(np.uint8) * 255) & mask
-    # Inpaint at half resolution for speed, then paste back only the masked
-    # pixels so unmasked detail stays full resolution.
+    hsv = cv2.cvtColor(card_rgb, cv2.COLOR_RGB2HSV)
+    washed = (hsv[:, :, 2] >= 240) & (hsv[:, :, 1] < 35) & (mask > 0)
+    fill = cv2.dilate(washed.astype(np.uint8) * 255,
+                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) & mask
+    if (fill > 0).mean() > max_frac:
+        fill = ((hsv[:, :, 2] >= 250) & (mask > 0)).astype(np.uint8) * 255
+    if not fill.any():
+        return card_rgb, mask
+    # Inpaint at half resolution for speed, then paste back only the filled
+    # pixels so everything else keeps full resolution.
     small = cv2.resize(card_rgb, (card_rgb.shape[1] // 2, card_rgb.shape[0] // 2),
                        interpolation=cv2.INTER_AREA)
-    small_mask = cv2.resize(mask, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_NEAREST)
-    filled = cv2.inpaint(small, small_mask, 5, cv2.INPAINT_TELEA)
+    small_fill = cv2.resize(fill, (small.shape[1], small.shape[0]), interpolation=cv2.INTER_NEAREST)
+    filled = cv2.inpaint(small, small_fill, 5, cv2.INPAINT_TELEA)
     filled = cv2.resize(filled, (card_rgb.shape[1], card_rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
     out = card_rgb.copy()
-    out[mask > 0] = filled[mask > 0]
+    out[fill > 0] = filled[fill > 0]
     return out, mask
 
 

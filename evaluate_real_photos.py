@@ -208,7 +208,9 @@ def evaluate(photo_dir: Path, gt: Dict[str, List[str]], identifier, save_vis: Op
         for cq in quads:
             res = identifier.identify_quad(rgb, cq)
             res['det_score'] = cq.score
-            if (res['score'] >= min_score and res.get('margin', 1.0) >= 0.04) or single:
+            accepted = res['accepted'] if 'accepted' in res else \
+                (res['score'] >= min_score and res.get('margin', 1.0) >= 0.04)
+            if accepted or single:
                 preds.append(res)
         if single and preds:
             preds = [max(preds, key=lambda r: r['score'])]
@@ -289,7 +291,8 @@ class FullPipelineAdapter:
         top = res['top_k']
         return {'name': self.cards[top[0][0]]['name'], 'score': res['confidence'],
                 'margin': res['margin'], 'corners': res['corners'],
-                'variant': res.get('variant', 'primary')}
+                'variant': res.get('variant', 'primary'),
+                'accepted': res['quality'] in ('strong', 'good', 'weak')}
 
 
 def main():

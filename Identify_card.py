@@ -92,11 +92,17 @@ EMBEDDING_DIM = 256
 # both routes (art crop / whole card) are scored.
 FRAME_CONFIDENCE_THRESHOLD = 0.70
 
-# A match is accepted in multi-card mode when its fused score and its margin
-# over the best *different* card clear these. Single-card mode always
-# returns the best guess, with the confidence alongside.
-ACCEPT_SCORE = 0.30
-ACCEPT_MARGIN = 0.04
+# Match quality grades, from the local-feature verification (how much of
+# the illustration actually matched) and the margin over the best card with
+# a *different name*. The fused score ranks candidates well but isn't a good
+# yes/no signal: retrieval similarity is high-ish even for a wrong card when
+# the right one isn't in the database. Measured on real photos: true matches
+# verify at >= 0.2 (>= ~14 illustration inliers), a card missing from the
+# database at < 0.1.
+QUALITY_STRONG = 0.45
+QUALITY_GOOD = (0.20, 0.05)   # (verify, margin)
+QUALITY_WEAK = (0.12, 0.03)
+ACCEPTED_QUALITIES = ('strong', 'good', 'weak')
 
 NORMALIZE = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ART_TRANSFORM = T.Compose([T.Resize((ART_INPUT, ART_INPUT)), T.ToTensor(), NORMALIZE])
@@ -487,6 +493,22 @@ class MultiRegionIdentifier:
             'region_image': top_h['region'],
         }
 
+    @staticmethod
+    def match_quality(res: dict) -> str:
+        if res['pipeline_route'] == 'fast_hash':
+            return 'strong'
+        v = (res.get('verification') or {}).get('verify')
+        m = res['margin']
+        if v is None:  # verification disabled: margin is all we have
+            return 'good' if m >= 0.10 else 'weak' if m >= 0.05 else 'unknown'
+        if v >= QUALITY_STRONG and m >= 0.03:
+            return 'strong'
+        if v >= QUALITY_GOOD[0] and m >= QUALITY_GOOD[1]:
+            return 'good'
+        if v >= QUALITY_WEAK[0] and m >= QUALITY_WEAK[1]:
+            return 'weak'
+        return 'unknown'
+
     def _name_margin(self, scored) -> float:
         """Score gap between the top candidate and the best candidate with a
         *different name* (reprints of the same card aren't competition)."""
@@ -497,9 +519,9 @@ class MultiRegionIdentifier:
         return scored[0][0]
 
     def identify_quad(self, rgb: np.ndarray, cq: CardQuad, top_k: int = 5,
-                      use_ocr: bool = True, confident: float = 0.55,
-                      confident_margin: float = 0.08) -> dict:
-        """Try the outline variants of one detection; keep the best match."""
+                      use_ocr: bool = True) -> dict:
+        """Try the outline variants of one detection; keep the best match.
+        Stops early once a variant matches convincingly."""
         best = None
         for label, corners in quad_variants(cq):
             card = warp_quad(rgb, corners)
@@ -508,9 +530,10 @@ class MultiRegionIdentifier:
             res['corners'] = np.roll(corners, 2, axis=0) if res['rotate180'] else corners
             res['detection_score'] = cq.score
             res['detection_source'] = cq.source
+            res['quality'] = self.match_quality(res)
             if best is None or res['confidence'] > best['confidence']:
                 best = res
-            if best['confidence'] >= confident and best['margin'] >= confident_margin:
+            if best['quality'] in ('strong', 'good') and best['margin'] >= 0.08:
                 break
         return best
 
@@ -533,7 +556,7 @@ class MultiRegionIdentifier:
             res['timings']['detect_ms'] = detect_ms / max(len(quads), 1)
             res['timings']['total_ms'] = sum(res['timings'].values())
             res['detection_route'] = cq.source
-            if res['confidence'] >= ACCEPT_SCORE and res['margin'] >= ACCEPT_MARGIN:
+            if res['quality'] in ACCEPTED_QUALITIES:
                 results.append(res)
         return sorted(results, key=lambda r: -r['confidence'])
 
@@ -584,6 +607,10 @@ def _describe(result, cards) -> List[str]:
         lines.append(f"  Type:          {c.get('type_line', '?')}")
     if c.get('mana_cost'):
         lines.append(f"  Mana cost:     {c.get('mana_cost')}")
+    quality = result.get('quality', '?')
+    note = {'strong': '', 'good': '', 'weak': '  (check it)',
+            'unknown': '  (probably not in the database, or not a card)'}.get(quality, '')
+    lines.append(f"  Match:         {quality}{note}")
     lines.append(f"  Confidence:    {result['confidence']:.3f}  (margin {result['margin']:.3f})")
     lines.append(f"  Frame class:   {result['predicted_frame']} ({result['frame_confidence']:.2f})"
                  f" -> route via {result['region_label']}")
@@ -669,7 +696,7 @@ def display_all(image_path, results, cards, show: bool = True, output_path: Opti
     for i, r in enumerate(results, 1):
         c = cards[r['top_k'][0][0]]
         print(f"  {i:>2}. {c['name']:<40} {c.get('set', '').upper():>6}  "
-              f"conf={r['confidence']:.3f}  margin={r['margin']:.3f}")
+              f"{r['quality']:<7} conf={r['confidence']:.3f}  margin={r['margin']:.3f}")
     if not (show or output_path):
         return
     rgb = MultiRegionIdentifier.load_image(image_path)
@@ -912,8 +939,9 @@ def run_batch(pipeline, cards, input_dir: Path, output_dir: Path, use_ocr: bool 
                 result = pipeline.identify(str(img_path), top_k=5, use_ocr=use_ocr)
                 top1_name = cards[result['top_k'][0][0]]['name']
                 save_result_figure(str(img_path), result, cards, output_dir / out_name)
-                print(f"→ {top1_name}  (conf {result['confidence']:.2f})")
+                print(f"→ {top1_name}  ({result['quality']}, conf {result['confidence']:.2f})")
                 summary.append({'file': img_path.name, 'card': top1_name,
+                                'quality': result['quality'],
                                 'confidence': round(result['confidence'], 4),
                                 'margin': round(result['margin'], 4)})
         except Exception as e:

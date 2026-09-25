@@ -4,16 +4,19 @@ Train the identification components of the MTG pipeline.
 Run train_detector.py first to get mtg_data/yolo_card_best.pt. This script
 trains everything else.
 
-Key change from v1: synthetic augmentation now uses a "hard" pipeline that
-matches what the benchmark throws at inference time - higher rotation,
-glare, occlusion, color jitter, blur, and noise. This trades training
-speed for inference robustness on hard photos.
+v3: synthetic training crops come from photo_synthesis.py - realistic phone
+photos (camera tilt / perspective, sleeves, specular glare and streaks,
+shadows, fingers, dice, play-mat / wood / cloth / paper backgrounds, white
+balance, blur, noise, JPEG) rectified back to 488x680 with detector-like
+corner error, and usually glare-inpainted, i.e. the same inputs the
+identifier produces at inference time.
 
-  - Frame classifier: more synthetic exposure (60% vs 30% before) at hard
-    intensity. The 66% accuracy on hard benchmark images was caused by the
-    model never seeing those conditions during training.
-  - Re-rankers: same higher synthetic ratio, with a controllable difficulty
-    distribution (40% medium, 30% hard, 30% clean).
+  - Frame classifier: 60% synthetic exposure across easy / medium / hard.
+  - Re-rankers: 60% synthetic, difficulty mix 30% easy / 40% medium /
+    30% hard; hard negatives mined every 3 epochs (vectorised, scales to
+    the full database).
+  - --backgrounds DIR adds your own table / play-mat photos to the
+    background pool, the single most effective realism boost.
 
 Inputs:
   mtg_data/cards_metadata.json
@@ -39,10 +42,12 @@ Usage:
   python train_identifier.py --easy-aug         # use the old gentler augmentation
                                                 # (faster training, worse robustness)
   python train_identifier.py --epochs 8         # shorter training
+  python train_identifier.py --backgrounds my_table_photos/
 """
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -72,6 +77,8 @@ from mtg_layout import (
     phash_64, dhash_64, hamming_distance_vectorized,
     inspect_metadata,
 )
+from photo_synthesis import BackgroundBank, synthesize_card_photo
+from card_matching import remove_glare
 
 warnings.filterwarnings('ignore')
 
@@ -90,6 +97,10 @@ WHOLE_EMB_PATH = DATA_DIR / 'whole_embeddings.npy'
 SET_CLF_PATH = DATA_DIR / 'set_classifier.pth'
 SET_CODES_PATH = DATA_DIR / 'set_codes.json'
 FRAME_CACHE_PATH = DATA_DIR / 'frame_classes_cache.json'
+# Optional folders of real background photos (tables, play mats) for the
+# synthetic training photos. Set with --backgrounds; passed to DataLoader
+# workers through the environment so it also works with spawn (Windows).
+BACKGROUND_DIRS_ENV = 'MTG_BACKGROUND_DIRS'
 
 ART_INPUT = 160
 WHOLE_INPUT = 224
@@ -183,309 +194,53 @@ def is_alt_art(card: dict) -> bool:
     return False
 
 
-def add_sleeve_overlay(image: np.ndarray, strength: float = 0.5) -> np.ndarray:
-    """Simulate a card sleeve with semi-transparent border and rainbow glare
-    streaks, replicating what real phone photos look like."""
-    h, w = image.shape[:2]
-    out = image.copy().astype(np.float32)
-
-    # Slight border expansion (sleeve edge)
-    border = random.randint(2, max(3, int(min(h, w) * 0.03)))
-    out[:border, :] = out[:border, :] * 0.7 + 40 * 0.3
-    out[-border:, :] = out[-border:, :] * 0.7 + 40 * 0.3
-    out[:, :border] = out[:, :border] * 0.7 + 40 * 0.3
-    out[:, -border:] = out[:, -border:] * 0.7 + 40 * 0.3
-
-    # Rainbow glare streak (horizontal or diagonal)
-    n_streaks = random.randint(1, 3)
-    for _ in range(n_streaks):
-        y0 = random.randint(0, h - 1)
-        thickness = random.randint(max(1, h // 30), max(2, h // 10))
-        y1 = min(h, y0 + thickness)
-        # Random rainbow color per streak
-        color = np.array([random.randint(100, 255),
-                          random.randint(100, 255),
-                          random.randint(100, 255)], dtype=np.float32)
-        streak_strength = random.uniform(0.15, strength)
-        # Gradient mask across the streak
-        mask = np.zeros((y1 - y0, w), dtype=np.float32)
-        for row in range(y1 - y0):
-            frac = row / max(1, y1 - y0 - 1)
-            mask[row, :] = np.sin(frac * np.pi) * streak_strength
-        for c in range(3):
-            out[y0:y1, :, c] = out[y0:y1, :, c] * (1 - mask) + color[c] * mask
-
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def add_shadow_gradient(image: np.ndarray, strength: float = 0.4) -> np.ndarray:
-    """Add a directional shadow gradient to simulate uneven indoor lighting."""
-    h, w = image.shape[:2]
-    direction = random.choice(['top', 'bottom', 'left', 'right', 'corner'])
-    shadow = np.ones((h, w), dtype=np.float32)
-
-    if direction == 'top':
-        grad = np.linspace(1.0 - strength, 1.0, h).reshape(-1, 1)
-        shadow = np.broadcast_to(grad, (h, w)).copy()
-    elif direction == 'bottom':
-        grad = np.linspace(1.0, 1.0 - strength, h).reshape(-1, 1)
-        shadow = np.broadcast_to(grad, (h, w)).copy()
-    elif direction == 'left':
-        grad = np.linspace(1.0 - strength, 1.0, w).reshape(1, -1)
-        shadow = np.broadcast_to(grad, (h, w)).copy()
-    elif direction == 'right':
-        grad = np.linspace(1.0, 1.0 - strength, w).reshape(1, -1)
-        shadow = np.broadcast_to(grad, (h, w)).copy()
-    else:  # corner
-        cx = random.choice([0, w])
-        cy = random.choice([0, h])
-        ys, xs = np.mgrid[0:h, 0:w]
-        dist = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2).astype(np.float32)
-        dist = dist / (dist.max() + 1e-6)
-        shadow = 1.0 - strength * (1.0 - dist)
-
-    out = image.astype(np.float32)
-    for c in range(3):
-        out[:, :, c] *= shadow
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def add_phone_camera_artifacts(image: np.ndarray) -> np.ndarray:
-    """Simulate phone-camera artifacts: slight vignette, chromatic aberration,
-    JPEG compression artifacts."""
-    h, w = image.shape[:2]
-    out = image.copy()
-
-    # Vignette
-    if random.random() < 0.5:
-        ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-        cx, cy = w / 2, h / 2
-        dist = np.sqrt((xs - cx) ** 2 + (ys - cy) ** 2)
-        max_dist = np.sqrt(cx ** 2 + cy ** 2)
-        vignette = 1.0 - 0.3 * (dist / max_dist) ** 2
-        for c in range(3):
-            out[:, :, c] = np.clip(out[:, :, c].astype(np.float32) * vignette,
-                                   0, 255).astype(np.uint8)
-
-    # JPEG compression artifacts
-    if random.random() < 0.4:
-        quality = random.randint(50, 85)
-        _, buf = cv2.imencode('.jpg', out, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        out = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-        out = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
-
-    return out
-
-
-def make_random_background(size: int, difficulty: str = 'medium') -> np.ndarray:
-    """
-    Background generation parameterized by difficulty. The hard mode adds
-    cluttered backgrounds with colored blobs, matching what benchmark_v2
-    generates as test images.
-    """
-    if difficulty == 'easy':
-        modes = ['solid', 'gradient']
-    elif difficulty == 'medium':
-        modes = ['solid', 'gradient', 'noise', 'wood']
-    else:  # hard
-        modes = ['noise', 'wood', 'cluttered', 'cluttered']
-
-    mode = random.choice(modes)
-
-    if mode == 'solid':
-        c = tuple(random.randint(0, 255) for _ in range(3))
-        return np.full((size, size, 3), c, dtype=np.uint8)
-
-    if mode == 'gradient':
-        c1 = np.array([random.randint(0, 255) for _ in range(3)], dtype=np.float32)
-        c2 = np.array([random.randint(0, 255) for _ in range(3)], dtype=np.float32)
-        bg = np.zeros((size, size, 3), dtype=np.uint8)
-        if random.random() < 0.5:
-            for i in range(size):
-                t = i / size
-                bg[i, :] = (c1 * (1-t) + c2 * t).astype(np.uint8)
-        else:
-            for j in range(size):
-                t = j / size
-                bg[:, j] = (c1 * (1-t) + c2 * t).astype(np.uint8)
-        return bg
-
-    if mode == 'noise':
-        bg = np.random.randint(0, 256, (size, size, 3), dtype=np.uint8)
-        return cv2.GaussianBlur(bg, (21, 21), 0)
-
-    if mode == 'wood':
-        base = np.array([random.randint(70, 160), random.randint(50, 130),
-                         random.randint(30, 90)], dtype=np.float32)
-        var = random.uniform(20, 50)
-        bg = np.zeros((size, size, 3), dtype=np.uint8)
-        for j in range(size):
-            wave = (np.sin(j / random.uniform(8, 25)) * var
-                    + np.sin(j / random.uniform(40, 80)) * var * 0.5)
-            bg[:, j] = np.clip(base + wave, 0, 255).astype(np.uint8)
-        return cv2.GaussianBlur(bg, (5, 5), 0)
-
-    # cluttered
-    bg = np.random.randint(40, 200, (size, size, 3), dtype=np.uint8)
-    bg = cv2.GaussianBlur(bg, (31, 31), 0)
-    for _ in range(random.randint(3, 8)):
-        cx, cy = random.randint(0, size), random.randint(0, size)
-        radius = random.randint(size // 8, size // 3)
-        color = tuple(random.randint(20, 230) for _ in range(3))
-        cv2.circle(bg, (cx, cy), radius, color, -1)
-    return cv2.GaussianBlur(bg, (51, 51), 0)
-
-
-def add_glare(image: np.ndarray, strength: float = 0.4) -> np.ndarray:
-    h, w = image.shape[:2]
-    cx = random.randint(int(w*0.2), int(w*0.8))
-    cy = random.randint(int(h*0.2), int(h*0.8))
-    radius = random.randint(min(h, w) // 6, min(h, w) // 3)
-    glare = np.zeros((h, w), dtype=np.float32)
-    cv2.circle(glare, (cx, cy), radius, 1.0, -1)
-    glare = cv2.GaussianBlur(glare, (51, 51), 0)
-    glare = (glare / glare.max()) * 255 * strength
-    out = image.astype(np.float32)
-    for c in range(3):
-        out[:, :, c] = np.clip(out[:, :, c] + glare, 0, 255)
-    return out.astype(np.uint8)
-
-
 # ===========================================================================
-# Synthetic compositing - now with difficulty parameter
+# Synthetic photos
 #
-# The big change vs the previous trainer: each call to synthesize_rectified_card
-# can target a specific difficulty level. The defaults match what
-# benchmark_v2.py throws at the model, so the training distribution actually
-# covers the test distribution.
+# Training crops come from photo_synthesis.py: the card is photographed by a
+# simulated camera (3-D tilt, perspective), possibly sleeved, on a play mat /
+# wood / cloth / paper background, with specular glare, shadows, fingers,
+# dice and camera noise - then rectified back through its corners plus a
+# small localisation error, exactly as identify_card.py does. Like the
+# identifier, glare is usually inpainted before the crop reaches the model,
+# so the networks learn on the same inputs they see at inference.
+
+_BANK: Optional[BackgroundBank] = None
+_ALL_IMAGE_PATHS: Optional[List[Path]] = None
+
+
+def _background_bank() -> BackgroundBank:
+    """Built lazily per DataLoader worker (works with fork and spawn)."""
+    global _BANK, _ALL_IMAGE_PATHS
+    if _BANK is None:
+        _ALL_IMAGE_PATHS = list(IMAGE_DIR.glob('*.jpg'))
+
+        def art_sampler():
+            if _ALL_IMAGE_PATHS:
+                img = cv2.imread(str(random.choice(_ALL_IMAGE_PATHS)))
+                if img is not None:
+                    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return np.zeros((CARD_H, CARD_W, 3), np.uint8)
+        dirs = [Path(d) for d in os.environ.get(BACKGROUND_DIRS_ENV, '').split(os.pathsep) if d]
+        _BANK = BackgroundBank(art_sampler=art_sampler, photo_dirs=dirs)
+    return _BANK
+
 
 def synthesize_rectified_card(card_img: np.ndarray,
-                               difficulty: str = 'medium') -> np.ndarray:
+                               difficulty: str = 'medium',
+                               p_inpaint_glare: float = 0.7) -> np.ndarray:
     """
-    Composite a card onto a random background, then re-rectify to 488x680
-    with detector-error jitter. Difficulty controls rotation, glare,
-    occlusion, blur, color cast, and corner jitter intensity.
+    A realistic photo of the card, rectified to 488x680 with detector-like
+    corner error. Difficulty controls camera tilt, glare, sleeves, shadows,
+    occluders and camera degradation (see photo_synthesis.DIFFICULTY).
     """
-    H_card, W_card = card_img.shape[:2]
-    canvas = random.randint(500, 900)
-    bg = make_random_background(canvas, difficulty=difficulty)
-
-    # Difficulty-dependent parameters - match the benchmark synthesizer
-    if difficulty == 'easy':
-        scale = random.uniform(0.55, 0.80)
-        angle_range = 10
-        glare_p = 0.0
-        occlusion_p = 0.0
-        color_jitter = 15
-        bright_jitter = (0.85, 1.15)
-        blur_p = 0.2
-        noise_p = 0.0
-        corner_jitter = 0.02
-    elif difficulty == 'medium':
-        scale = random.uniform(0.55, 0.85)
-        angle_range = 25
-        glare_p = 0.3
-        occlusion_p = 0.0
-        color_jitter = 25
-        bright_jitter = (0.7, 1.3)
-        blur_p = 0.4
-        noise_p = 0.4
-        corner_jitter = 0.04
-    else:  # hard
-        scale = random.uniform(0.45, 0.85)
-        angle_range = 60
-        glare_p = 0.5
-        occlusion_p = 0.4
-        color_jitter = 40
-        bright_jitter = (0.5, 1.5)
-        blur_p = 0.5
-        noise_p = 0.5
-        corner_jitter = 0.06
-
-    new_h = int(canvas * scale)
-    new_w = int(new_h * W_card / H_card)
-    if new_w > canvas * 0.9:
-        new_w = int(canvas * 0.9)
-        new_h = int(new_w * H_card / W_card)
-    card_resized = cv2.resize(card_img, (new_w, new_h))
-
-    # Card-level lighting + color jitter (before placement)
-    card_f = card_resized.astype(np.float32)
-    card_f *= random.uniform(*bright_jitter)
-    card_f += random.uniform(-color_jitter, color_jitter)
-    card_resized = np.clip(card_f, 0, 255).astype(np.uint8)
-    if random.random() < glare_p:
-        card_resized = add_glare(card_resized, strength=random.uniform(0.3, 0.6))
-
-    # Rotation + position
-    angle = random.uniform(-angle_range, angle_range)
-    margin = int(max(new_w, new_h) * 0.7)
-    margin = min(margin, canvas // 2 - 1)
-    cx = random.randint(margin, max(margin + 1, canvas - margin))
-    cy = random.randint(margin, max(margin + 1, canvas - margin))
-
-    M = cv2.getRotationMatrix2D((new_w / 2, new_h / 2), angle, 1.0)
-    M[0, 2] += cx - new_w / 2
-    M[1, 2] += cy - new_h / 2
-
-    warped = cv2.warpAffine(card_resized, M, (canvas, canvas))
-    mask = cv2.warpAffine(np.ones((new_h, new_w), dtype=np.uint8) * 255,
-                          M, (canvas, canvas))
-    scene = bg.copy()
-    scene[mask > 0] = warped[mask > 0]
-
-    # Compute true corners and jitter them (simulates imperfect detection)
-    corners = np.array([[0, 0], [new_w, 0], [new_w, new_h], [0, new_h]],
-                       dtype=np.float32)
-    corners_warped = cv2.transform(corners.reshape(1, -1, 2), M).reshape(-1, 2)
-
-    # Optional occlusion - cover one corner before re-rectifying
-    if random.random() < occlusion_p:
-        ci = random.randint(0, 3)
-        cx_o, cy_o = corners_warped[ci].astype(int)
-        rect_w = random.randint(int(canvas*0.08), int(canvas*0.18))
-        rect_h = random.randint(int(canvas*0.08), int(canvas*0.18))
-        x0 = max(0, cx_o - rect_w // 2)
-        y0 = max(0, cy_o - rect_h // 2)
-        x1 = min(canvas, x0 + rect_w)
-        y1 = min(canvas, y0 + rect_h)
-        color = tuple(random.randint(40, 200) for _ in range(3))
-        cv2.rectangle(scene, (x0, y0), (x1, y1), color, -1)
-
-    # Sleeve overlay (replicates real card-in-sleeve appearance)
-    if random.random() < (0.4 if difficulty == 'hard' else 0.15):
-        scene_with_sleeve = add_sleeve_overlay(
-            warped, strength=random.uniform(0.2, 0.5))
-        scene[mask > 0] = scene_with_sleeve[mask > 0]
-
-    # Shadow gradient (replicates uneven indoor lighting)
-    if random.random() < (0.5 if difficulty == 'hard' else 0.2):
-        scene = add_shadow_gradient(scene, strength=random.uniform(0.15, 0.45))
-
-    # Whole-scene blur and noise
-    if random.random() < blur_p:
-        ksize = random.choice([3, 5, 7])
-        scene = cv2.GaussianBlur(scene, (ksize, ksize), 0)
-    if random.random() < noise_p:
-        nz = np.random.randint(-8, 9, scene.shape, dtype=np.int16)
-        scene = np.clip(scene.astype(np.int16) + nz, 0, 255).astype(np.uint8)
-
-    # Phone camera artifacts (vignette, JPEG compression)
-    if random.random() < (0.3 if difficulty == 'hard' else 0.1):
-        scene = add_phone_camera_artifacts(scene)
-
-    # Corner jitter for re-rectification (simulates detector error)
-    jitter = random.uniform(0, corner_jitter) * max(new_w, new_h)
-    jittered = corners_warped + np.random.uniform(
-        -jitter, jitter, corners_warped.shape).astype(np.float32)
-
-    dst = np.array([[0, 0], [CARD_W-1, 0], [CARD_W-1, CARD_H-1], [0, CARD_H-1]],
-                   dtype=np.float32)
-    try:
-        M_rect = cv2.getPerspectiveTransform(jittered.astype(np.float32), dst)
-        return cv2.warpPerspective(scene, M_rect, (CARD_W, CARD_H))
-    except cv2.error:
-        return cv2.resize(card_img, (CARD_W, CARD_H))
+    rng = np.random.default_rng(random.getrandbits(32))
+    jitter = {'easy': 0.008, 'medium': 0.012, 'hard': 0.018}[difficulty]
+    out = synthesize_card_photo(card_img, difficulty, _background_bank(),
+                                corner_jitter=jitter, rng=rng)
+    if random.random() < p_inpaint_glare:
+        out, _ = remove_glare(out)
+    return out
 
 
 def sample_difficulty(easy_aug: bool = False) -> str:
@@ -812,58 +567,66 @@ class TripletRegionDataset(Dataset):
         return self._augment(anchor), self._augment(pos), self._augment(neg)
 
 
-def mine_hard_negatives(model, dataset, top_k: int = 10):
+class CleanRegionDataset(Dataset):
+    """Un-augmented region crops (module level so spawn workers can pickle it)."""
+
+    def __init__(self, cards, indices, region_extractor, transform):
+        self.cards = cards
+        self.indices = indices
+        self.region_extractor = region_extractor
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        img = load_card_image(self.cards[self.indices[i]]['id'])
+        if img is None:
+            img = np.zeros((CARD_H, CARD_W, 3), dtype=np.uint8)
+        return self.transform(Image.fromarray(self.region_extractor(img)))
+
+
+def mine_hard_negatives(model, dataset, top_k: int = 10, batch_size: int = 256):
     """
-    Find the hardest negatives for each anchor by running the model over
-    all cards and finding which non-matching cards have the highest similarity.
-    Returns dict mapping anchor_idx -> list of hard negative indices.
+    Find the hardest negatives for each anchor: the cards with a different
+    name whose clean embeddings are closest. Returns dict mapping
+    anchor_idx -> list of hard negative indices.
+
+    Embeddings are computed in batches and the search runs as blocked matrix
+    products on the GPU, so this scales to the full 90k-card database (the
+    previous version compared names in a Python double loop - O(N^2)
+    interpreter steps).
     """
     print("  Mining hard negatives...")
     model.eval()
+    unique = list(dict.fromkeys(dataset.valid))  # oversampled alt-art -> once
 
-    # Build embeddings for all cards without augmentation
     eval_tf = T.Compose([
         T.Resize((dataset.input_size, dataset.input_size)),
         T.ToTensor(),
         T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    embeddings = []
+    loader = DataLoader(CleanRegionDataset(dataset.cards, unique, dataset.region_extractor, eval_tf),
+                        batch_size=batch_size, shuffle=False, num_workers=4)
+    embs = []
     with torch.no_grad():
-        for idx in tqdm(dataset.valid, desc="    embedding", leave=False):
-            card_img = load_card_image(dataset.cards[idx]['id'])
-            if card_img is None:
-                embeddings.append(torch.zeros(EMBEDDING_DIM))
-                continue
-            region = dataset.region_extractor(card_img)
-            t = eval_tf(Image.fromarray(region)).unsqueeze(0).to(DEVICE)
-            emb = model(t).cpu()
-            embeddings.append(emb[0])
+        for x in tqdm(loader, desc="    embedding", leave=False):
+            embs.append(model(x.to(DEVICE)))
+    embs = torch.cat(embs)
 
-    embeddings = torch.stack(embeddings)
-
-    # For each anchor, find top-k most similar cards that are NOT the same name
+    name_ids = {}
+    ids = torch.tensor([name_ids.setdefault(dataset.cards[i]['name'], len(name_ids)) for i in unique],
+                       device=embs.device)
+    k = min(top_k, len(unique) - 1)
     hard_negatives = {}
-    for i, anchor_idx in enumerate(tqdm(dataset.valid, desc="    mining", leave=False)):
-        anchor_name = dataset.cards[anchor_idx]['name']
-        anchor_emb = embeddings[i].unsqueeze(0)
-
-        # Compute similarity to all other cards
-        sims = (anchor_emb @ embeddings.T).squeeze()
-
-        # Mask out same-name cards
-        mask = torch.ones(len(dataset.valid), dtype=torch.bool)
-        for j, other_idx in enumerate(dataset.valid):
-            if dataset.cards[other_idx]['name'] == anchor_name:
-                mask[j] = False
-
-        # Get top-k highest similarity negatives
-        valid_sims = sims.clone()
-        valid_sims[~mask] = -1.0
-        _, top_indices = torch.topk(valid_sims, min(top_k, mask.sum().item()))
-
-        hard_negatives[anchor_idx] = [dataset.valid[j] for j in top_indices.tolist()]
-
+    for s in tqdm(range(0, len(unique), 1024), desc="    mining", leave=False):
+        sims = embs[s:s + 1024] @ embs.T
+        same = ids[s:s + 1024, None] == ids[None, :]
+        sims[same] = -2.0
+        top = sims.topk(k, dim=1).indices.cpu().tolist()
+        for r, row in enumerate(top):
+            hard_negatives[unique[s + r]] = [unique[j] for j in row]
     print(f"    mined {len(hard_negatives)} anchor -> hard negative mappings")
     return hard_negatives
 
@@ -1315,6 +1078,8 @@ def parse_args():
     p.add_argument('--rebuild-frame-cache', action='store_true',
                    help="Recompute frame classes from scratch")
     p.add_argument('--epochs', type=int, default=DEFAULT_EPOCHS)
+    p.add_argument('--backgrounds', type=str, nargs='*', default=[],
+                   help="Folders of real background photos (tables, mats) for synthesis")
     p.add_argument('--no-sanity', action='store_true')
     return p.parse_args()
 
@@ -1322,6 +1087,8 @@ def parse_args():
 def main():
     args = parse_args()
     random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+    if args.backgrounds:
+        os.environ[BACKGROUND_DIRS_ENV] = os.pathsep.join(args.backgrounds)
 
     print("=" * 70)
     print("MTG Identifier - Multi-Region Trainer (v2: hard augmentation)")
