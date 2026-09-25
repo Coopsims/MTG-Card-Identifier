@@ -3,23 +3,28 @@ Train a YOLO oriented-bounding-box detector specialized for MTG cards.
 
 The pretrained yolo11n-obb.pt was trained on aerial imagery and finds
 random sub-regions of card art instead of the card itself. This script
-fine-tunes it on synthetic scenes where one MTG card is composited onto
-a textured background at a known orientation.
+fine-tunes it on synthetic photos of cards.
 
-Key change vs v1: synthetic scenes now span easy / medium / hard difficulty
-levels matching what benchmark_v2.py produces at inference time. The
-previous trainer only generated mild-difficulty scenes, which is why the
-detector held up perfectly on the validation set (mAP50-95 = 0.995) but
-struggled on hard benchmark images where cards were heavily rotated,
-occluded, or sitting on cluttered backgrounds.
+v3: scenes come from photo_synthesis.py and look like real phone photos -
+several cards per photo (scattered, in a grid, fanned in a hand), camera
+tilt with true perspective, sleeves, specular glare / streaks / rainbow
+sheen, shadows, fingers and dice, phones / ID cards / paper as negatives,
+play-mat, wood, cloth and paper backgrounds, white balance, blur, noise and
+JPEG. Scenes vary in aspect ratio like real photos.
 
-Difficulty distribution (controllable via --easy-mix and --hard-mix flags):
-  Default: 30% easy, 40% medium, 30% hard
+At inference identify_card.py snaps YOLO's rotated boxes onto the real card
+edges (card_detection.refine_quad), so perspective is handled even though
+the OBB head can only express rotated rectangles.
+
+Difficulty distribution:
+  Default: 25% easy, 40% medium, 35% hard
   --easy-mix:  60% easy, 40% medium, 0% hard  (faster, less robust)
 
 Inputs:
   mtg_data/cards_metadata.json
   mtg_data/card_images/{id}.jpg
+  --backgrounds DIR   (optional) photos of your tables / play mats / desks
+                      without cards - the most effective realism boost
 
 Outputs:
   mtg_data/yolo_card/                       (synthetic scenes + YOLO labels)
@@ -28,12 +33,13 @@ Outputs:
 
 Usage:
   python train_detector.py                  # default: hard-mix scenes, 50 epochs
-  python train_detector.py --easy-mix       # use the v1 easy-only mix
+  python train_detector.py --easy-mix       # gentler mix
   python train_detector.py --gen-only       # generate scenes, don't train
   python train_detector.py --train-only     # data already generated
-  python train_detector.py --n-train 10000  # bigger dataset
+  python train_detector.py --n-train 15000  # bigger dataset
   python train_detector.py --epochs 30      # shorter training
   python train_detector.py --show           # preview a few generated scenes
+  python train_detector.py --backgrounds my_table_photos/
 """
 
 import argparse
@@ -42,6 +48,7 @@ import random
 import shutil
 import warnings
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import matplotlib.pyplot as plt
@@ -50,6 +57,7 @@ from PIL import Image, ImageOps
 from tqdm import tqdm
 
 from mtg_layout import CARD_W, CARD_H
+from photo_synthesis import BackgroundBank, synthesize_scene
 
 warnings.filterwarnings('ignore')
 
@@ -61,8 +69,10 @@ YOLO_RUNS = DATA_DIR / 'yolo_card_runs'
 YOLO_BEST_OUT = DATA_DIR / 'yolo_card_best.pt'
 DATASET_YAML = YOLO_DATA / 'cards_obb.yaml'
 REAL_LABELS_PATH = DATA_DIR / 'real_photo_labels.json'
+# Your folder of real photos; used for validation when --real-photos isn't given
+DEFAULT_REAL_PHOTOS_FOLDER = Path(r"C:\Users\Ben Funk\PycharmProjects\DS-Capstone-2\Mtg-Cards")
 
-DEFAULT_N_TRAIN = 5000
+DEFAULT_N_TRAIN = 8000
 DEFAULT_N_VAL = 500
 DEFAULT_IMGSZ = 640
 DEFAULT_EPOCHS = 50
@@ -71,210 +81,81 @@ SEED = 42
 
 
 # ===========================================================================
-# Background generation (matches train_identifier.py and benchmark_v2.py)
-
-def make_background(size: int, difficulty: str = 'medium') -> np.ndarray:
-    if difficulty == 'easy':
-        modes = ['solid', 'gradient']
-    elif difficulty == 'medium':
-        modes = ['solid', 'gradient', 'noise', 'wood']
-    else:  # hard
-        modes = ['noise', 'wood', 'cluttered', 'cluttered']
-
-    mode = random.choice(modes)
-
-    if mode == 'solid':
-        c = tuple(random.randint(0, 255) for _ in range(3))
-        return np.full((size, size, 3), c, dtype=np.uint8)
-
-    if mode == 'gradient':
-        c1 = np.array([random.randint(0, 255) for _ in range(3)], dtype=np.float32)
-        c2 = np.array([random.randint(0, 255) for _ in range(3)], dtype=np.float32)
-        bg = np.zeros((size, size, 3), dtype=np.uint8)
-        if random.random() < 0.5:
-            for i in range(size):
-                t = i / size
-                bg[i, :] = (c1 * (1-t) + c2 * t).astype(np.uint8)
-        else:
-            for j in range(size):
-                t = j / size
-                bg[:, j] = (c1 * (1-t) + c2 * t).astype(np.uint8)
-        return bg
-
-    if mode == 'noise':
-        bg = np.random.randint(0, 256, (size, size, 3), dtype=np.uint8)
-        return cv2.GaussianBlur(bg, (21, 21), 0)
-
-    if mode == 'wood':
-        base = np.array([random.randint(70, 160), random.randint(50, 130),
-                         random.randint(30, 90)], dtype=np.float32)
-        var = random.uniform(20, 50)
-        bg = np.zeros((size, size, 3), dtype=np.uint8)
-        for j in range(size):
-            wave = (np.sin(j / random.uniform(8, 25)) * var
-                    + np.sin(j / random.uniform(40, 80)) * var * 0.5)
-            bg[:, j] = np.clip(base + wave, 0, 255).astype(np.uint8)
-        return cv2.GaussianBlur(bg, (5, 5), 0)
-
-    # cluttered
-    bg = np.random.randint(40, 200, (size, size, 3), dtype=np.uint8)
-    bg = cv2.GaussianBlur(bg, (31, 31), 0)
-    for _ in range(random.randint(3, 8)):
-        cx, cy = random.randint(0, size), random.randint(0, size)
-        radius = random.randint(size // 8, size // 3)
-        color = tuple(random.randint(20, 230) for _ in range(3))
-        cv2.circle(bg, (cx, cy), radius, color, -1)
-    return cv2.GaussianBlur(bg, (51, 51), 0)
-
-
-def add_glare(image: np.ndarray, strength: float = 0.4) -> np.ndarray:
-    h, w = image.shape[:2]
-    cx = random.randint(int(w*0.2), int(w*0.8))
-    cy = random.randint(int(h*0.2), int(h*0.8))
-    radius = random.randint(min(h, w) // 6, min(h, w) // 3)
-    glare = np.zeros((h, w), dtype=np.float32)
-    cv2.circle(glare, (cx, cy), radius, 1.0, -1)
-    glare = cv2.GaussianBlur(glare, (51, 51), 0)
-    glare = (glare / glare.max()) * 255 * strength
-    out = image.astype(np.float32)
-    for c in range(3):
-        out[:, :, c] = np.clip(out[:, :, c] + glare, 0, 255)
-    return out.astype(np.uint8)
-
-
-# ===========================================================================
-# Scene synthesis with corner labels
+# Scene synthesis
 #
-# Returns the scene + the four oriented corners of the card, normalized to
-# [0, 1] for YOLO-OBB labels. The corners are post-rotation, so they're the
-# actual visible card corners in the scene.
+# Scenes come from photo_synthesis.py: several cards per photo seen through a
+# tilted camera (true perspective, not just in-plane rotation), sleeves,
+# specular glare, shadows, fingers and dice, phones / ID cards / paper as
+# negatives, and play-mat / wood / cloth / paper backgrounds. Labels are
+# the corners of every card that is at least 60% visible.
 
-def synthesize_scene_with_corners(card_img: np.ndarray, canvas: int,
-                                   difficulty: str = 'medium'):
-    """
-    Returns (scene, corners_normalized) where:
-      scene: HxWx3 uint8 image at canvas resolution
-      corners_normalized: 4x2 array of (x, y) in [0, 1], oriented so
-                          corners[0] is top-left, [1] top-right,
-                          [2] bottom-right, [3] bottom-left.
-    """
-    H_card, W_card = card_img.shape[:2]
-    bg = make_background(canvas, difficulty=difficulty)
+_BANK: Optional[BackgroundBank] = None
 
-    # Difficulty-dependent parameters
-    if difficulty == 'easy':
-        scale = random.uniform(0.40, 0.70)
-        angle_range = 15
-        glare_p = 0.0
-        occlusion_p = 0.0
-        color_jitter = 15
-        bright_jitter = (0.85, 1.15)
-        blur_p = 0.2
-    elif difficulty == 'medium':
-        scale = random.uniform(0.35, 0.65)
-        angle_range = 30
-        glare_p = 0.3
-        occlusion_p = 0.0
-        color_jitter = 25
-        bright_jitter = (0.7, 1.3)
-        blur_p = 0.4
-    else:  # hard
-        scale = random.uniform(0.30, 0.60)
-        angle_range = 60
-        glare_p = 0.5
-        occlusion_p = 0.4
-        color_jitter = 40
-        bright_jitter = (0.5, 1.5)
-        blur_p = 0.5
 
-    new_h = int(canvas * scale)
-    new_w = int(new_h * W_card / H_card)
-    if new_w > canvas * 0.9:
-        new_w = int(canvas * 0.9)
-        new_h = int(new_w * H_card / W_card)
-    card_resized = cv2.resize(card_img, (new_w, new_h))
-
-    # Card-level color and lighting jitter
-    card_f = card_resized.astype(np.float32)
-    card_f *= random.uniform(*bright_jitter)
-    card_f += random.uniform(-color_jitter, color_jitter)
-    card_resized = np.clip(card_f, 0, 255).astype(np.uint8)
-    if random.random() < glare_p:
-        card_resized = add_glare(card_resized, strength=random.uniform(0.3, 0.6))
-
-    # Rotation + position
-    angle = random.uniform(-angle_range, angle_range)
-    margin = int(max(new_w, new_h) * 0.6)
-    margin = min(margin, canvas // 2 - 1)
-    cx = random.randint(margin, max(margin + 1, canvas - margin))
-    cy = random.randint(margin, max(margin + 1, canvas - margin))
-
-    M = cv2.getRotationMatrix2D((new_w / 2, new_h / 2), angle, 1.0)
-    M[0, 2] += cx - new_w / 2
-    M[1, 2] += cy - new_h / 2
-
-    warped = cv2.warpAffine(card_resized, M, (canvas, canvas))
-    mask = cv2.warpAffine(np.ones((new_h, new_w), dtype=np.uint8) * 255,
-                          M, (canvas, canvas))
-    scene = bg.copy()
-    scene[mask > 0] = warped[mask > 0]
-
-    # Corner positions in the rotated scene
-    corners = np.array([[0, 0], [new_w, 0], [new_w, new_h], [0, new_h]],
-                       dtype=np.float32)
-    corners_warped = cv2.transform(corners.reshape(1, -1, 2), M).reshape(-1, 2)
-
-    # Optional occlusion - cover one corner. We DON'T modify the corner
-    # labels; the detector should learn to predict the true card extent
-    # even when one corner is hidden, otherwise it'll always under-predict.
-    if random.random() < occlusion_p:
-        ci = random.randint(0, 3)
-        cx_o, cy_o = corners_warped[ci].astype(int)
-        rect_w = random.randint(int(canvas*0.08), int(canvas*0.18))
-        rect_h = random.randint(int(canvas*0.08), int(canvas*0.18))
-        x0 = max(0, cx_o - rect_w // 2)
-        y0 = max(0, cy_o - rect_h // 2)
-        x1 = min(canvas, x0 + rect_w)
-        y1 = min(canvas, y0 + rect_h)
-        color = tuple(random.randint(40, 200) for _ in range(3))
-        cv2.rectangle(scene, (x0, y0), (x1, y1), color, -1)
-
-    if random.random() < blur_p:
-        ksize = random.choice([3, 5, 7])
-        scene = cv2.GaussianBlur(scene, (ksize, ksize), 0)
-
-    # Normalize corners to [0, 1] for YOLO labels
-    corners_normalized = corners_warped / canvas
-
-    return scene, corners_normalized
+def get_background_bank(card_paths, background_dirs=()) -> BackgroundBank:
+    global _BANK
+    if _BANK is None:
+        def art_sampler():
+            img = cv2.imread(str(random.choice(card_paths)))
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if img is not None else np.zeros((CARD_H, CARD_W, 3), np.uint8)
+        _BANK = BackgroundBank(art_sampler=art_sampler, photo_dirs=background_dirs)
+    return _BANK
 
 
 def sample_difficulty_for_detector(easy_mix: bool = False) -> str:
-    """30% easy, 40% medium, 30% hard by default."""
-    if easy_mix:
-        r = random.random()
-        return 'easy' if r < 0.6 else 'medium'
+    """25% easy, 40% medium, 35% hard by default."""
     r = random.random()
-    if r < 0.30:
+    if easy_mix:
+        return 'easy' if r < 0.6 else 'medium'
+    if r < 0.25:
         return 'easy'
-    if r < 0.70:
+    if r < 0.65:
         return 'medium'
     return 'hard'
+
+
+def _load_card(path) -> np.ndarray:
+    card_img = np.array(Image.open(path).convert('RGB'))
+    if card_img.shape[0] != CARD_H or card_img.shape[1] != CARD_W:
+        card_img = cv2.resize(card_img, (CARD_W, CARD_H))
+    return card_img
+
+
+def synthesize_detector_scene(card_paths, imgsz: int, difficulty: str,
+                              bank: BackgroundBank, rng: np.random.Generator):
+    """
+    One training photo. Returns (scene, list of 4x2 corner arrays
+    normalised to [0, 1]). Aspect ratio varies like phone photos; YOLO
+    letterboxes to imgsz at train time.
+    """
+    aspect = rng.choice([1.0, 4 / 3, 3 / 4, 16 / 9, 9 / 16])
+    w = imgsz if aspect >= 1 else int(imgsz * aspect)
+    h = int(imgsz / aspect) if aspect >= 1 else imgsz
+    n = int(rng.choice([1, 1, 1, 2, 2, 3, 4, 5, 6, 8], p=None))
+    if difficulty == 'easy':
+        n = min(n, 2)
+    cards = [_load_card(random.choice(card_paths)) for _ in range(n)]
+    scene, found = synthesize_scene(cards, (w, h), difficulty, bank, rng)
+    corners = [f['corners'] / np.array([w, h], np.float32) for f in found]
+    return scene, [np.clip(c, 0, 1) for c in corners]
 
 
 # ===========================================================================
 # Dataset construction
 
-def write_yolo_obb_label(label_path: Path, corners_normalized: np.ndarray):
+def write_yolo_obb_label(label_path: Path, corners_list):
     """
-    YOLO-OBB label format per line: <class> x1 y1 x2 y2 x3 y3 x4 y4
-    All values normalized to [0, 1]. Class 0 = card.
+    YOLO-OBB label format, one line per card: <class> x1 y1 x2 y2 x3 y3 x4 y4
+    All values normalized to [0, 1]. Class 0 = card. An empty file is a
+    valid negative (photo with no cards).
     """
-    parts = ['0']
-    for x, y in corners_normalized:
-        parts.append(f"{x:.6f}")
-        parts.append(f"{y:.6f}")
-    label_path.write_text(' '.join(parts) + '\n')
+    if isinstance(corners_list, np.ndarray) and corners_list.ndim == 2:
+        corners_list = [corners_list]
+    lines = []
+    for corners in corners_list:
+        parts = ['0'] + [f"{v:.6f}" for xy in corners for v in xy]
+        lines.append(' '.join(parts))
+    label_path.write_text('\n'.join(lines) + ('\n' if lines else ''))
 
 
 def inject_real_photos(real_folder: Path, labels_path: Path, imgsz: int,
@@ -347,8 +228,11 @@ def inject_real_photos(real_folder: Path, labels_path: Path, imgsz: int,
 
 def generate_dataset(card_paths, n_train: int, n_val: int, imgsz: int,
                      easy_mix: bool, seed: int = SEED,
-                     real_folder: Path = None, real_oversample: int = 10):
-    rng = random.Random(seed)
+                     real_folder: Path = None, real_oversample: int = 10,
+                     background_dirs=()):
+    random.seed(seed)
+    rng = np.random.default_rng(seed)
+    bank = get_background_bank(card_paths, background_dirs)
 
     train_img = YOLO_DATA / 'train' / 'images'
     train_lab = YOLO_DATA / 'train' / 'labels'
@@ -359,32 +243,19 @@ def generate_dataset(card_paths, n_train: int, n_val: int, imgsz: int,
             shutil.rmtree(d)
         d.mkdir(parents=True, exist_ok=True)
 
-    diff_counts_train = {'easy': 0, 'medium': 0, 'hard': 0}
-    diff_counts_val = {'easy': 0, 'medium': 0, 'hard': 0}
-
-    print(f"  train: generating {n_train} scenes...")
-    for i in tqdm(range(n_train)):
-        card_path = rng.choice(card_paths)
-        card_img = np.array(Image.open(card_path).convert('RGB'))
-        if card_img.shape[0] != CARD_H or card_img.shape[1] != CARD_W:
-            card_img = cv2.resize(card_img, (CARD_W, CARD_H))
-        difficulty = sample_difficulty_for_detector(easy_mix=easy_mix)
-        diff_counts_train[difficulty] += 1
-        scene, corners = synthesize_scene_with_corners(card_img, imgsz, difficulty)
-        Image.fromarray(scene).save(train_img / f"scene_{i:06d}.jpg", quality=88)
-        write_yolo_obb_label(train_lab / f"scene_{i:06d}.txt", corners)
-
-    print(f"  val: generating {n_val} scenes...")
-    for i in tqdm(range(n_val)):
-        card_path = rng.choice(card_paths)
-        card_img = np.array(Image.open(card_path).convert('RGB'))
-        if card_img.shape[0] != CARD_H or card_img.shape[1] != CARD_W:
-            card_img = cv2.resize(card_img, (CARD_W, CARD_H))
-        difficulty = sample_difficulty_for_detector(easy_mix=easy_mix)
-        diff_counts_val[difficulty] += 1
-        scene, corners = synthesize_scene_with_corners(card_img, imgsz, difficulty)
-        Image.fromarray(scene).save(val_img / f"scene_{i:06d}.jpg", quality=88)
-        write_yolo_obb_label(val_lab / f"scene_{i:06d}.txt", corners)
+    for split, n, img_dir, lab_dir in (('train', n_train, train_img, train_lab),
+                                       ('val', n_val, val_img, val_lab)):
+        diff_counts = {'easy': 0, 'medium': 0, 'hard': 0}
+        n_cards = 0
+        print(f"  {split}: generating {n} scenes...")
+        for i in tqdm(range(n)):
+            difficulty = sample_difficulty_for_detector(easy_mix=easy_mix)
+            diff_counts[difficulty] += 1
+            scene, corners = synthesize_detector_scene(card_paths, imgsz, difficulty, bank, rng)
+            n_cards += len(corners)
+            Image.fromarray(scene).save(img_dir / f"scene_{i:06d}.jpg", quality=90)
+            write_yolo_obb_label(lab_dir / f"scene_{i:06d}.txt", corners)
+        print(f"  {split} difficulty mix: {diff_counts}, {n_cards} labelled cards")
 
     # YOLO dataset YAML - paths must be relative to the YAML file's directory
     DATASET_YAML.parent.mkdir(parents=True, exist_ok=True)
@@ -396,8 +267,6 @@ def generate_dataset(card_paths, n_train: int, n_val: int, imgsz: int,
         f"names: ['card']\n"
     )
     print(f"  Wrote {DATASET_YAML}")
-    print(f"  train difficulty mix: {diff_counts_train}")
-    print(f"  val difficulty mix:   {diff_counts_val}")
 
     # Inject real photos if available
     if real_folder is not None:
@@ -418,13 +287,14 @@ def show_samples(n: int = 9):
         # Overlay the labeled corners
         label = Path(str(path).replace('images', 'labels').replace('.jpg', '.txt'))
         if label.exists():
-            tokens = label.read_text().strip().split()
-            coords = np.array([float(x) for x in tokens[1:]]).reshape(-1, 2)
-            coords[:, 0] *= img.shape[1]
-            coords[:, 1] *= img.shape[0]
-            poly = coords.astype(np.int32).reshape(-1, 1, 2)
             img_with_box = img.copy()
-            cv2.polylines(img_with_box, [poly], True, (0, 255, 0), 3)
+            for line in label.read_text().strip().splitlines():
+                tokens = line.split()
+                coords = np.array([float(x) for x in tokens[1:]]).reshape(-1, 2)
+                coords[:, 0] *= img.shape[1]
+                coords[:, 1] *= img.shape[0]
+                poly = coords.astype(np.int32).reshape(-1, 1, 2)
+                cv2.polylines(img_with_box, [poly], True, (0, 255, 0), 3)
             ax.imshow(img_with_box)
         else:
             ax.imshow(img)
@@ -436,23 +306,27 @@ def show_samples(n: int = 9):
 # ===========================================================================
 # Training
 
-def train_yolo(epochs: int, imgsz: int, batch: int):
+def train_yolo(epochs: int, imgsz: int, batch: int, base_weights: str = 'yolo11n-obb.pt',
+               workers: int = 8, device=None):
     from ultralytics import YOLO
 
     YOLO_RUNS.mkdir(parents=True, exist_ok=True)
-    model = YOLO('yolo11n-obb.pt')
-    print(f"\nTraining for {epochs} epochs at {imgsz}px (batch={batch})...")
+    model = YOLO(base_weights)
+    print(f"\nTraining {base_weights} for {epochs} epochs at {imgsz}px (batch={batch})...")
 
+    extra = {'device': device} if device is not None else {}
     results = model.train(
         data=str(DATASET_YAML),
         epochs=epochs,
         imgsz=imgsz,
         batch=batch,
+        workers=workers,
         project=str(YOLO_RUNS),
         name='cards',
         exist_ok=True,
-        # Augmentation tweaks - the synthetic data already has rotation,
-        # color jitter, etc. baked in, so we don't want Ultralytics adding
+        **extra,
+        # Augmentation tweaks - the synthetic data already has perspective,
+        # colour, glare, etc. baked in, so we don't want Ultralytics adding
         # heavy mosaic or perspective on top.
         mosaic=0.3,
         mixup=0.0,
@@ -660,14 +534,23 @@ def main():
                         help="Display 9 generated samples and exit")
     parser.add_argument('--validate-only', action='store_true',
                         help="Skip generation and training; just validate on real photos")
+    parser.add_argument('--backgrounds', type=str, nargs='*', default=[],
+                        help="Folders of background photos (tables, mats) without cards")
+    parser.add_argument('--base-weights', type=str, default='yolo11n-obb.pt',
+                        help="Starting checkpoint (e.g. yolo11s-obb.pt for a larger model, "
+                             "or mtg_data/yolo_card_best.pt to continue training)")
+    parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--device', type=str, default=None, help="e.g. 0, cpu")
     parser.add_argument('--seed', type=int, default=SEED)
     args = parser.parse_args()
+    if args.real_photos is None and DEFAULT_REAL_PHOTOS_FOLDER.is_dir():
+        args.real_photos = str(DEFAULT_REAL_PHOTOS_FOLDER)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
 
     print("=" * 70)
-    print("YOLO Card Detector - Training (v2: hard-mix scenes)")
+    print("YOLO Card Detector - Training (v3: realistic photo synthesis)")
     print("=" * 70)
 
     if args.show:
@@ -689,14 +572,16 @@ def main():
         generate_dataset(card_paths, args.n_train, args.n_val, args.imgsz,
                           easy_mix=args.easy_mix, seed=args.seed,
                           real_folder=real_folder,
-                          real_oversample=args.real_oversample)
+                          real_oversample=args.real_oversample,
+                          background_dirs=[Path(d) for d in args.backgrounds])
 
     if args.gen_only:
         print("\nGeneration complete. Run again with --train-only to train.")
         return
 
     if not args.validate_only:
-        train_yolo(epochs=args.epochs, imgsz=args.imgsz, batch=args.batch)
+        train_yolo(epochs=args.epochs, imgsz=args.imgsz, batch=args.batch,
+                   base_weights=args.base_weights, workers=args.workers, device=args.device)
 
         print("\n" + "=" * 70)
         print("Detector training complete.")
@@ -712,36 +597,4 @@ def main():
 
 
 if __name__ == '__main__':
-    REAL_PHOTOS_FOLDER = Path(r"C:\Users\Ben Funk\PycharmProjects\DS-Capstone-2\Mtg-Cards")
-
-    random.seed(SEED)
-    np.random.seed(SEED)
-
-    print("=" * 70)
-    print("YOLO Card Detector - Training (v2: hard-mix scenes)")
-    print("=" * 70)
-
-    # Locate source cards
-    card_paths = list(IMAGE_DIR.glob('*.jpg'))
-    if not card_paths:
-        print(f"ERROR: no cards found in {IMAGE_DIR}")
-    else:
-        print(f"Source cards: {len(card_paths)} on disk")
-        print(f"Difficulty mix: hard mix (default)")
-        print(f"Generating {DEFAULT_N_TRAIN} train + {DEFAULT_N_VAL} val scenes "
-              f"at {DEFAULT_IMGSZ}px...")
-        generate_dataset(card_paths, DEFAULT_N_TRAIN, DEFAULT_N_VAL, DEFAULT_IMGSZ,
-                         easy_mix=False, seed=SEED,
-                         real_folder=REAL_PHOTOS_FOLDER,
-                         real_oversample=10)
-
-        train_yolo(epochs=DEFAULT_EPOCHS, imgsz=DEFAULT_IMGSZ, batch=DEFAULT_BATCH)
-
-        print("\n" + "=" * 70)
-        print("Detector training complete.")
-        print(f"Use {YOLO_BEST_OUT} in the identifier instead of yolo11n-obb.pt")
-        print("=" * 70)
-
-        # Validate on real photos
-        if YOLO_BEST_OUT.exists():
-            validate_on_real_photos(YOLO_BEST_OUT, REAL_PHOTOS_FOLDER, imgsz=DEFAULT_IMGSZ)
+    main()
