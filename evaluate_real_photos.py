@@ -30,6 +30,8 @@ Usage:
   python evaluate_real_photos.py real_photos/ --pipeline full
   python evaluate_real_photos.py real_photos/ --gt real_photos/gt.json --reference-dir refs/
   python evaluate_real_photos.py real_photos/ ... --save-vis out/   # overlays
+  python evaluate_real_photos.py real_photos/ --reference-dir refs/ \
+         --yolo mtg_data/yolo_card_best.pt --detector yolo            # detector ablation
 """
 import argparse
 import json
@@ -183,15 +185,36 @@ class ReferenceFolderIdentifier:
 # ---------------------------------------------------------------------------
 # Evaluation
 
+class StandaloneDetector:
+    """Classical detection, optionally combined with a YOLO-OBB checkpoint."""
+
+    def __init__(self, yolo_weights: Optional[Path] = None, mode: str = 'both'):
+        self.model = None
+        self.mode = mode
+        if yolo_weights is not None and mode != 'classical':
+            from ultralytics import YOLO
+            self.model = YOLO(str(yolo_weights))
+
+    def __call__(self, rgb: np.ndarray, single: bool = False) -> List[CardQuad]:
+        yq, yc = None, None
+        if self.model is not None:
+            obb = self.model(rgb, conf=0.10, iou=0.5, verbose=False)[0].obb
+            if obb is not None and len(obb):
+                yq = [c.reshape(4, 2) for c in obb.xyxyxyxy.cpu().numpy()]
+                yc = obb.conf.cpu().numpy().tolist()
+        quads = find_card_quads(rgb, extra_quads=yq, extra_scores=yc,
+                                use_contours=self.mode != 'yolo' or self.model is None)
+        if not quads:
+            quads = [full_image_quad(rgb)]
+        return quads
+
+
 def detect(rgb: np.ndarray, single: bool) -> List[CardQuad]:
-    quads = find_card_quads(rgb, max_cards=1 if single else None)
-    if not quads:
-        quads = [full_image_quad(rgb)]
-    return quads
+    return StandaloneDetector()(rgb, single)
 
 
 def evaluate(photo_dir: Path, gt: Dict[str, List[str]], identifier, save_vis: Optional[Path],
-             min_score: float, verbose: bool = True):
+             min_score: float, verbose: bool = True, detector=None):
     totals = Counter()
     rows = []
     for fname, true_names in sorted(gt.items()):
@@ -202,8 +225,12 @@ def evaluate(photo_dir: Path, gt: Dict[str, List[str]], identifier, save_vis: Op
         rgb = load_rgb(path)
         t0 = time.perf_counter()
         single = len(true_names) == 1
-        quads = identifier.detect(rgb, single=False) if hasattr(identifier, 'detect') \
-            else detect(rgb, single=False)
+        if detector is not None:
+            quads = detector(rgb, single=False)
+        elif hasattr(identifier, 'detect'):
+            quads = identifier.detect(rgb, single=False)
+        else:
+            quads = detect(rgb, single=False)
         preds, used = [], []
         for cq in quads:
             res = identifier.identify_quad(rgb, cq)
@@ -307,6 +334,10 @@ def main():
                     help="Drop multi-card predictions below this confidence")
     ap.add_argument('--save-vis', type=Path, default=None, help="Write overlays here")
     ap.add_argument('--ocr', action='store_true', help="Allow OCR tie-breaks (full pipeline)")
+    ap.add_argument('--yolo', type=Path, default=None,
+                    help="YOLO-OBB weights for --reference-dir mode (default: classical only)")
+    ap.add_argument('--detector', choices=['both', 'classical', 'yolo'], default='both',
+                    help="Which detector(s) to use with --reference-dir (needs --yolo for yolo/both)")
     args = ap.parse_args()
 
     if args.gt is not None:
@@ -315,15 +346,17 @@ def main():
         gt_file = args.photos / 'ground_truth.json'
         gt = json.loads(gt_file.read_text()) if gt_file.exists() else ground_truth_from_filenames(args.photos)
 
+    detector = None
     if args.reference_dir is not None:
         identifier = ReferenceFolderIdentifier(args.reference_dir)
+        detector = StandaloneDetector(args.yolo, args.detector)
     elif args.pipeline == 'full':
         identifier = FullPipelineAdapter(use_ocr=args.ocr)
     else:
         print("Choose --pipeline full or --reference-dir DIR")
         sys.exit(1)
 
-    evaluate(args.photos, gt, identifier, args.save_vis, args.min_score)
+    evaluate(args.photos, gt, identifier, args.save_vis, args.min_score, detector=detector)
 
 
 if __name__ == '__main__':

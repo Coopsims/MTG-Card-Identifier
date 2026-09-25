@@ -29,6 +29,7 @@ Usage:
   python Identify_card.py --no-gui             # forces stdin input
   python Identify_card.py --no-ocr             # skip OCR even on close calls
   python Identify_card.py --fast               # skip local-feature verification
+  python Identify_card.py --yolo-only          # skip classical detection (faster)
 """
 
 import argparse
@@ -190,9 +191,10 @@ class CardDetector:
     """
 
     def __init__(self, weights_path: Path = YOLO_BEST, verbose: bool = True,
-                 use_yolo: bool = True, yolo_conf: float = 0.10):
+                 use_yolo: bool = True, yolo_conf: float = 0.10, use_classical: bool = True):
         self.model = None
         self.yolo_conf = yolo_conf
+        self.use_classical = use_classical
         if use_yolo and weights_path.exists():
             from ultralytics import YOLO
             self.model = YOLO(str(weights_path))
@@ -216,7 +218,8 @@ class CardDetector:
     def detect(self, image: np.ndarray, max_cards: Optional[int] = None) -> List[CardQuad]:
         yq, yc = self.propose(image)
         quads = find_card_quads(image, extra_quads=yq or None, extra_scores=yc or None,
-                                max_cards=max_cards)
+                                max_cards=max_cards,
+                                use_contours=self.use_classical or self.model is None)
         # A pre-cropped photo or clean scan: the card *is* the image
         full = full_image_quad(image)
         covered = any(q.area > 0.8 * image.shape[0] * image.shape[1] for q in quads)
@@ -775,7 +778,7 @@ def _load_embeddings(path: Path) -> np.ndarray:
 
 
 def load_everything(verbose: bool = True, use_parallel: bool = True, verify: bool = True,
-                    use_ocr: bool = True, use_yolo: bool = True):
+                    use_ocr: bool = True, use_yolo: bool = True, use_classical: bool = True):
     if verbose:
         print(f"Device: {DEVICE}")
         print("Loading metadata, hash DB, models, embeddings...")
@@ -833,7 +836,8 @@ def load_everything(verbose: bool = True, use_parallel: bool = True, verify: boo
     elif verbose:
         print(f"  Set classifier not found - tie-break will use OCR only")
 
-    detector = CardDetector(weights_path=YOLO_BEST, verbose=verbose, use_yolo=use_yolo)
+    detector = CardDetector(weights_path=YOLO_BEST, verbose=verbose, use_yolo=use_yolo,
+                            use_classical=use_classical)
 
     title_ocr = None
     if use_ocr:
@@ -972,6 +976,8 @@ def main():
                         help="Skip local-feature verification (faster, less robust to glare)")
     parser.add_argument('--no-yolo', action='store_true',
                         help="Use only the classical card detector")
+    parser.add_argument('--yolo-only', action='store_true',
+                        help="Skip the classical detector (faster; needs yolo_card_best.pt)")
     args = parser.parse_args()
 
     use_ocr = not args.no_ocr
@@ -981,7 +987,8 @@ def main():
         use_ocr = False
 
     cards, pipeline = load_everything(use_parallel=not args.no_parallel, verify=not args.fast,
-                                      use_ocr=use_ocr, use_yolo=not args.no_yolo)
+                                      use_ocr=use_ocr, use_yolo=not args.no_yolo,
+                                      use_classical=not args.yolo_only)
 
     if batch:
         input_dir = Path(batch)

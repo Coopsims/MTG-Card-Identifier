@@ -776,7 +776,7 @@ class _ContourDeduper:
 def find_card_quads(rgb: np.ndarray, extra_quads: Optional[Sequence[np.ndarray]] = None,
                     extra_scores: Optional[Sequence[float]] = None,
                     max_cards: Optional[int] = None,
-                    min_score: float = 0.5) -> List[CardQuad]:
+                    min_score: float = 0.5, use_contours: bool = True) -> List[CardQuad]:
     """
     Find cards in a photo. Returns CardQuads sorted by score (best first),
     with corners in full-resolution coordinates in portrait order. Each
@@ -785,6 +785,8 @@ def find_card_quads(rgb: np.ndarray, extra_quads: Optional[Sequence[np.ndarray]]
     extra_quads: optional rough quads from another detector (e.g. YOLO, in
     full-resolution coordinates). They are refined onto real edges and
     compete with the contour candidates; agreement boosts the score.
+    use_contours: False skips the classical candidates (only refines and
+    resolves extra_quads) - faster, relies entirely on the other detector.
     """
     H, W = rgb.shape[:2]
     s = min(1.0, WORK_LONG_SIDE / max(H, W))
@@ -801,7 +803,7 @@ def find_card_quads(rgb: np.ndarray, extra_quads: Optional[Sequence[np.ndarray]]
 
     # Cheap geometric pre-filter, then dedupe across binarisations
     raw = []
-    for bmap in _binarisations(work):
+    for bmap in (_binarisations(work) if use_contours else []):
         contours, _ = cv2.findContours(bmap, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         for cnt in contours:
             if len(cnt) < 20:
