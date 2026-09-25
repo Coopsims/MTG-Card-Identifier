@@ -4,7 +4,6 @@ import numpy as np
 from card_matching import (CandidateVerifier, expand_quad, glare_mask, remove_glare,
                            masked_correlation, correlation_features)
 from photo_synthesis import add_glare
-from mtg_layout import CARD_W, CARD_H
 
 
 def _washed(img, original):

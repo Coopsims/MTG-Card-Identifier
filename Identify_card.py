@@ -57,8 +57,7 @@ from mtg_layout import (
     phash_64, dhash_64, hamming_distance_vectorized,
 )
 from card_detection import (
-    CardQuad, find_card_quads, full_image_quad, warp_quad, order_corners_portrait,
-    draw_quads, CARD_ASPECT,
+    CardQuad, find_card_quads, full_image_quad, warp_quad, draw_quads,
 )
 from card_matching import (
     CandidateVerifier, remove_glare, quad_variants, fuse,
@@ -353,7 +352,8 @@ class MultiRegionIdentifier:
 
     def identify_card_image(self, card_img: np.ndarray, top_k: int = 5,
                             hash_candidates: int = 500, use_ocr: bool = True,
-                            n_candidates: int = 40, n_verify: int = 10) -> dict:
+                            n_candidates: int = 40, n_verify: int = 10,
+                            n_verify_max: int = 40) -> dict:
         """
         Identify a rectified 488x680 card (either orientation). Returns the
         ranked candidates plus confidence / margin for the top one.
@@ -425,14 +425,24 @@ class MultiRegionIdentifier:
         query = None
         if self.verify and not decisive:
             query = self.verifier.prepare_query(clean, glare)
-        for rank, (p, pos, rot, h_i) in enumerate(ranked):
-            v = {}
-            if query is not None and rank < n_verify:
+
+        def verify_range(lo, hi):
+            for p, pos, rot, h_i in ranked[lo:hi]:
                 v = self.verifier.score(query, pos, rotate180=(rot == 180))
-                total = fuse(p, v['verify'], w_verify=0.5)
-            else:
-                total = fuse(p, 0.0, w_verify=0.5) if query is not None else p
-            scored.append([total, pos, rot, h_i, v])
+                scored.append([fuse(p, v['verify'], w_verify=0.5), pos, rot, h_i, v])
+
+        if query is not None:
+            verify_range(0, n_verify)
+            # Nothing convincing among the first few: a misaligned crop or
+            # heavy glare can push the right card down the retrieval list,
+            # so look further before giving up.
+            if max(r[4]['verify'] for r in scored) < QUALITY_GOOD[0]:
+                verify_range(n_verify, n_verify_max)
+            n_done = len(scored)
+            scored += [[fuse(p, 0.0, w_verify=0.5), pos, rot, h_i, {}]
+                       for p, pos, rot, h_i in ranked[n_done:]]
+        else:
+            scored = [[p, pos, rot, h_i, {}] for p, pos, rot, h_i in ranked]
         scored.sort(key=lambda t: -t[0])
         timings['verify_ms'] = (time.perf_counter() - t0) * 1000
 

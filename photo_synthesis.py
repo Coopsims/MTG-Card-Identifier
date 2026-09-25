@@ -24,7 +24,6 @@ exactly where the trained detector and re-rankers failed:
 
 Everything here works in RGB uint8.
 """
-import random
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 

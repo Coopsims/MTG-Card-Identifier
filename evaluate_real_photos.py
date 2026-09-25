@@ -131,8 +131,8 @@ class ReferenceFolderIdentifier:
         corr = masked_cosine_scan(q_vec, q_valid, self.thumbs, self.thumbs_sq)
         return 0.5 * hash_prior + 0.5 * np.clip(corr, 0, 1)
 
-    def identify_card(self, card: np.ndarray, top_k: int = 5, n_retrieve: int = 20,
-                      n_verify: int = 10) -> dict:
+    def identify_card(self, card: np.ndarray, top_k: int = 5, n_retrieve: int = 30,
+                      n_verify: int = 10, n_verify_max: int = 40) -> dict:
         clean, mask = remove_glare(card)
         query = self.verifier.prepare_query(clean, mask)
         # Retrieve for both orientations, verify the best candidates overall
@@ -143,14 +143,16 @@ class ReferenceFolderIdentifier:
                 pool.append((float(prior[idx]), int(idx), rot))
         pool.sort(key=lambda t: -t[0])
         scored = []
-        for rank, (prior, idx, rot) in enumerate(pool):
-            if rank < n_verify:
+
+        def verify_range(lo, hi):
+            for prior, idx, rot in pool[lo:hi]:
                 s = self.verifier.score(query, idx, rotate180=rot)
-                total = fuse(prior, s['verify'])
-            else:
-                s = {}
-                total = fuse(prior, 0.0)
-            scored.append((total, idx, rot, s))
+                scored.append((fuse(prior, s['verify']), idx, rot, s))
+
+        verify_range(0, n_verify)
+        if max(t[3]['verify'] for t in scored) < 0.2:   # weak: look further down
+            verify_range(n_verify, n_verify_max)
+        scored += [(fuse(prior, 0.0), idx, rot, {}) for prior, idx, rot in pool[len(scored):]]
         scored.sort(key=lambda t: -t[0])
         top_total, top_idx, top_rot, top_s = scored[0]
         top_name = self.names[top_idx]
@@ -231,7 +233,7 @@ def evaluate(photo_dir: Path, gt: Dict[str, List[str]], identifier, save_vis: Op
             quads = identifier.detect(rgb, single=False)
         else:
             quads = detect(rgb, single=False)
-        preds, used = [], []
+        preds = []
         for cq in quads:
             res = identifier.identify_quad(rgb, cq)
             res['det_score'] = cq.score
