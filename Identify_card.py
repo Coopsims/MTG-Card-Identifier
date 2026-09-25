@@ -1,21 +1,34 @@
 """
-Identify a Magic: The Gathering card from an image.
+Identify Magic: The Gathering cards in real photos.
 
-Multi-region pipeline:
-  1. Detect + rectify with the fine-tuned YOLO
-  2. Predict frame class (modern / fullart / special)
-  3. Route to the right strategy:
-       modern  -> art crop -> art_phash + art re-ranker
-       fullart -> whole card -> whole_phash + whole re-ranker
-       special -> whole card -> whole_phash + whole re-ranker
-  4. For modern cards in close-call situations, set symbol classifier
-     and OCR can both contribute as tie-breakers
+Pipeline:
+  1. Detect every card: fine-tuned YOLO proposals + classical quad detection
+     (card_detection.py), refined onto the real card edges so perspective,
+     rotation and busy / non-white backgrounds don't skew the crop.
+  2. Rectify each card to 488x680 and inpaint glare (card_matching.py).
+  3. Predict the frame class (modern / fullart / special). When the frame
+     classifier is unsure, both extraction routes are tried.
+  4. Retrieve candidates from the WHOLE database: pHash/dHash distances plus
+     re-ranker embedding similarity over every card - not just the top hash
+     hits, which glare can push out of reach. Both 0 and 180 degree
+     orientations are scored.
+  5. Verify the best candidates with glare-aware local features (ORB +
+     RANSAC restricted to near-aligned matches) and masked correlation,
+     then fuse with the retrieval score.
+  6. Close calls on modern frames still go to the set-symbol classifier and
+     OCR, as before.
+  7. Each detection also has alternative outlines (inner frame, a card
+     inside a toploader, expanded white-border variants); whichever matches
+     best wins.
 
 Usage:
-  python identify_card.py                      # opens a file picker
-  python identify_card.py path/to/card.jpg     # identifies that file
-  python identify_card.py --no-gui             # forces stdin input
-  python identify_card.py --no-ocr             # skip OCR even on close calls
+  python Identify_card.py                      # opens a file picker
+  python Identify_card.py path/to/card.jpg     # identifies that file
+  python Identify_card.py photo.jpg --all      # every card in the photo
+  python Identify_card.py --batch folder/      # save a result figure per image
+  python Identify_card.py --no-gui             # forces stdin input
+  python Identify_card.py --no-ocr             # skip OCR even on close calls
+  python Identify_card.py --fast               # skip local-feature verification
 """
 
 import argparse
@@ -24,7 +37,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import cv2
 import matplotlib.pyplot as plt
@@ -41,7 +54,13 @@ from mtg_layout import (
     extract_art_crop, extract_whole_card, crop_region,
     FRAME_CLASSES, FRAME_CLASS_TO_IDX,
     phash_64, dhash_64, hamming_distance_vectorized,
-    is_valid_card_detection,
+)
+from card_detection import (
+    CardQuad, find_card_quads, full_image_quad, warp_quad, order_corners_portrait,
+    draw_quads, CARD_ASPECT,
+)
+from card_matching import (
+    CandidateVerifier, remove_glare, quad_variants, fuse,
 )
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -60,11 +79,24 @@ WHOLE_EMB_PATH = DATA_DIR / 'whole_embeddings.npy'
 SET_CLF_PATH = DATA_DIR / 'set_classifier.pth'
 SET_CODES_PATH = DATA_DIR / 'set_codes.json'
 
+# Folder processed when the script is run with no arguments (your photos)
+DEFAULT_BATCH_FOLDER = Path(r"C:\Users\Ben Funk\PycharmProjects\DS-Capstone-2\Mtg-Cards")
+
 ART_INPUT = 160
 WHOLE_INPUT = 224
 FRAME_INPUT = 96
 SETSYM_INPUT = 64
 EMBEDDING_DIM = 256
+
+# Below this softmax confidence the frame class is treated as uncertain and
+# both routes (art crop / whole card) are scored.
+FRAME_CONFIDENCE_THRESHOLD = 0.70
+
+# A match is accepted in multi-card mode when its fused score and its margin
+# over the best *different* card clear these. Single-card mode always
+# returns the best guess, with the confidence alongside.
+ACCEPT_SCORE = 0.30
+ACCEPT_MARGIN = 0.04
 
 NORMALIZE = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ART_TRANSFORM = T.Compose([T.Resize((ART_INPUT, ART_INPUT)), T.ToTensor(), NORMALIZE])
@@ -95,10 +127,12 @@ class FrameClassifier(nn.Module):
 
 
 class MobileNetReranker(nn.Module):
-    def __init__(self, embedding_dim: int = EMBEDDING_DIM):
+    def __init__(self, embedding_dim: int = EMBEDDING_DIM, pretrained: bool = False):
         super().__init__()
-        backbone = models.mobilenet_v3_large(
-            weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+        # At inference every weight comes from our checkpoint, so there's no
+        # need to download the ImageNet weights first.
+        weights = models.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None
+        backbone = models.mobilenet_v3_large(weights=weights)
         self.features = backbone.features
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.projection = nn.Sequential(
@@ -135,69 +169,63 @@ class SetSymbolClassifier(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Detector (uses fine-tuned weights)
+# Detector: YOLO proposals + classical quad detection
 
 class CardDetector:
-    CARD_ASPECT = CARD_W / CARD_H
-    ASPECT_TOLERANCE = 0.02
+    """
+    Finds cards and returns perspective-correct outlines.
 
-    def __init__(self, weights_path: Path = YOLO_BEST, verbose: bool = True):
-        from ultralytics import YOLO
-        if not weights_path.exists():
-            print(f"WARNING: {weights_path} not found. Falling back to pretrained YOLO.")
-            print("  Run train_detector.py to get a properly fine-tuned detector.")
-            self.model = YOLO('yolo11n-obb.pt')
-            self.is_finetuned = False
-        else:
+    The fine-tuned YOLO (if present) proposes rotated boxes; the classical
+    detector in card_detection.py proposes contour-based quads. YOLO boxes
+    are snapped onto the real card edges, both sets compete, and agreement
+    between them raises confidence. Without YOLO weights the classical
+    detector runs alone - the pretrained aerial-imagery YOLO is never used,
+    since it finds art fragments rather than cards.
+    """
+
+    def __init__(self, weights_path: Path = YOLO_BEST, verbose: bool = True,
+                 use_yolo: bool = True, yolo_conf: float = 0.10):
+        self.model = None
+        self.yolo_conf = yolo_conf
+        if use_yolo and weights_path.exists():
+            from ultralytics import YOLO
             self.model = YOLO(str(weights_path))
-            self.is_finetuned = True
             if verbose:
                 print(f"Loaded fine-tuned detector: {weights_path.name}")
+        elif verbose:
+            print(f"No fine-tuned YOLO at {weights_path} - using classical card detection only.")
+        self.is_finetuned = self.model is not None
 
-    def _looks_like_clean_card(self, image):
-        h, w = image.shape[:2]
-        if min(h, w) < 200:
-            return False
-        if max(h, w) > 1500:
-            return False  # phone photos always go through detection
-        return abs(w / h - self.CARD_ASPECT) < self.ASPECT_TOLERANCE
+    def propose(self, image: np.ndarray) -> Tuple[List[np.ndarray], List[float]]:
+        if self.model is None:
+            return [], []
+        results = self.model(image, conf=self.yolo_conf, iou=0.5, verbose=False)
+        obb = results[0].obb
+        if obb is None or len(obb) == 0:
+            return [], []
+        corners = obb.xyxyxyxy.cpu().numpy()
+        confs = obb.conf.cpu().numpy() if hasattr(obb, 'conf') else np.full(len(corners), 0.5)
+        return [c.reshape(4, 2) for c in corners], [float(c) for c in confs]
+
+    def detect(self, image: np.ndarray, max_cards: Optional[int] = None) -> List[CardQuad]:
+        yq, yc = self.propose(image)
+        quads = find_card_quads(image, extra_quads=yq or None, extra_scores=yc or None,
+                                max_cards=max_cards)
+        # A pre-cropped photo or clean scan: the card *is* the image
+        full = full_image_quad(image)
+        covered = any(q.area > 0.8 * image.shape[0] * image.shape[1] for q in quads)
+        if not quads:
+            quads = [full]
+        elif not covered and full.score > 0.4:
+            quads[0].alternatives.append(full)
+        return quads
 
     def detect_and_correct(self, image):
-        if self._looks_like_clean_card(image):
-            return cv2.resize(image, (CARD_W, CARD_H)), 'clean'
-
-        results = self.model(image, conf=0.10, iou=0.5, verbose=False)
-        if len(results[0].obb) == 0:
-            return cv2.resize(image, (CARD_W, CARD_H)), 'no_detection'
-
-        # Take highest-confidence detection
-        obb = results[0].obb
-        if hasattr(obb, 'conf') and len(obb.conf) > 0:
-            best_idx = int(obb.conf.argmax())
-        else:
-            best_idx = 0
-        corners = obb.xyxyxyxy[best_idx].cpu().numpy()
-        warped = self._warp(image, corners)
-
-        if not is_valid_card_detection(warped):
-            return cv2.resize(image, (CARD_W, CARD_H)), 'invalid_detection'
-
-        return warped, 'detected'
-
-    def _warp(self, image, corners):
-        rect = self._order(corners)
-        dst = np.array([[0, 0], [CARD_W-1, 0], [CARD_W-1, CARD_H-1], [0, CARD_H-1]],
-                       dtype=np.float32)
-        M = cv2.getPerspectiveTransform(rect, dst)
-        return cv2.warpPerspective(image, M, (CARD_W, CARD_H))
-
-    def _order(self, pts):
-        rect = np.zeros((4, 2), dtype=np.float32)
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)]; rect[2] = pts[np.argmax(s)]
-        d = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(d)]; rect[3] = pts[np.argmax(d)]
-        return rect
+        """Backwards-compatible single-card API: (rectified card, route)."""
+        quads = self.detect(image, max_cards=1)
+        q = quads[0]
+        route = 'clean' if q.source == 'full_image' else f'detected_{q.source}'
+        return warp_quad(image, q.corners), route
 
 
 # ---------------------------------------------------------------------------
@@ -217,8 +245,10 @@ class TitleOCR:
             self.name_to_idx[n.lower()].append(i)
 
     def candidates(self, card_image, top_k: int = 20):
-        h = card_image.shape[0]
-        crop = card_image[:int(h * 0.15), :]
+        h, w = card_image.shape[:2]
+        # Title bar only (skip the mana cost on the right)
+        crop = card_image[int(h * 0.03):int(h * 0.11), int(w * 0.04):int(w * 0.80)]
+        crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
         try:
             res = self.reader.readtext(crop)
         except Exception:
@@ -239,20 +269,23 @@ class TitleOCR:
 
 class MultiRegionIdentifier:
     """
-    Routes queries by predicted frame class. Each path uses its dedicated
-    hash index, embedding model, and embedding database.
+    Detects every card in a photo and identifies each one. Routes by
+    predicted frame class; each route has its own hash index, embedding
+    model and embedding database.
     """
 
     def __init__(self, cards, db, frame_clf, art_reranker, art_emb,
                  whole_reranker, whole_emb, set_clf, set_codes, detector,
-                 title_ocr=None):
+                 title_ocr=None, use_parallel: bool = True, verify: bool = True,
+                 image_dir: Path = IMAGE_DIR):
         self.cards = cards
         self.db_indices = db['indices']
         self.art_phash = db['art_phash']
         self.art_dhash = db['art_dhash']
         self.whole_phash = db['whole_phash']
         self.whole_dhash = db['whole_dhash']
-        self.frame_class_db = db.get('frame_class', None)
+        self.frame_class_db = db['frame_class'] if 'frame_class' in db else None
+        self.db_names = np.array([cards[int(i)]['name'] for i in self.db_indices])
 
         self.frame_clf = frame_clf
         self.art_reranker = art_reranker
@@ -261,15 +294,35 @@ class MultiRegionIdentifier:
         self.set_codes = set_codes  # list[str], index -> set code
         self.detector = detector
         self.title_ocr = title_ocr
+        self.use_parallel = use_parallel
+        self.verify = verify
+        self.image_dir = image_dir
 
         self.art_emb = art_emb
         self.whole_emb = whole_emb
+        self.verifier = CandidateVerifier(self._load_db_image)
 
-    def _classify_frame(self, card_img: np.ndarray) -> str:
+    # -- helpers -----------------------------------------------------------
+
+    def _load_db_image(self, pos: int) -> Optional[np.ndarray]:
+        card = self.cards[int(self.db_indices[pos])]
+        path = self.image_dir / f"{card['id']}.jpg"
+        if not path.exists():
+            return None
+        img = cv2.imread(str(path))
+        if img is None:
+            return None
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if img.shape[:2] != (CARD_H, CARD_W):
+            img = cv2.resize(img, (CARD_W, CARD_H), interpolation=cv2.INTER_AREA)
+        return img
+
+    def _classify_frame(self, card_img: np.ndarray) -> Tuple[str, float]:
         with torch.no_grad():
             t = FRAME_TRANSFORM(Image.fromarray(card_img)).unsqueeze(0).to(DEVICE)
-            idx = int(self.frame_clf(t).argmax(1).item())
-        return FRAME_CLASSES[idx]
+            probs = F.softmax(self.frame_clf(t), dim=1)[0]
+        idx = int(probs.argmax().item())
+        return FRAME_CLASSES[idx], float(probs[idx].item())
 
     def _classify_set(self, card_img: np.ndarray, top_k: int = 10) -> List[str]:
         if self.set_clf is None or not self.set_codes:
@@ -280,238 +333,309 @@ class MultiRegionIdentifier:
             top = self.set_clf(t).topk(top_k, dim=1).indices[0].cpu().tolist()
         return [self.set_codes[i] for i in top if i < len(self.set_codes)]
 
-    def identify(self, image_path: str, top_k: int = 5,
-                 hash_candidates: int = 500, use_ocr: bool = True):
-        timings = {}
+    def _route(self, route: str):
+        if route == 'modern':
+            return (extract_art_crop, self.art_phash, self.art_dhash, self.art_emb,
+                    self.art_reranker, ART_TRANSFORM, 'art crop')
+        return (extract_whole_card, self.whole_phash, self.whole_dhash, self.whole_emb,
+                self.whole_reranker, WHOLE_TRANSFORM, 'whole card')
 
-        # Stage 1: detect
-        t0 = time.perf_counter()
-        img = np.array(ImageOps.exif_transpose(Image.open(image_path)).convert('RGB'))
-        card_img, route = self.detector.detect_and_correct(img)
-        timings['detect_ms'] = (time.perf_counter() - t0) * 1000
+    # -- identification of one rectified card --------------------------------
 
-        # Stage 2: predict frame class
+    def identify_card_image(self, card_img: np.ndarray, top_k: int = 5,
+                            hash_candidates: int = 500, use_ocr: bool = True,
+                            n_candidates: int = 40, n_verify: int = 10) -> dict:
+        """
+        Identify a rectified 488x680 card (either orientation). Returns the
+        ranked candidates plus confidence / margin for the top one.
+        """
+        timings = defaultdict(float)
         t0 = time.perf_counter()
-        frame_class = self._classify_frame(card_img)
+        clean, glare = remove_glare(card_img)
+        timings['glare_ms'] = (time.perf_counter() - t0) * 1000
+
+        t0 = time.perf_counter()
+        frame_class, frame_conf = self._classify_frame(clean)
         timings['frame_ms'] = (time.perf_counter() - t0) * 1000
+        routes = [frame_class]
+        if self.use_parallel and frame_conf < FRAME_CONFIDENCE_THRESHOLD:
+            routes = ['modern', 'fullart']
+        routes = ['modern' if r == 'modern' else 'fullart' for r in routes]
+        routes = list(dict.fromkeys(routes))
 
-        # Stage 3: pick the right index and extractor for this frame class
-        if frame_class == 'modern':
-            region = extract_art_crop(card_img)
-            db_p, db_d = self.art_phash, self.art_dhash
-            emb_db = self.art_emb
-            reranker_model = self.art_reranker
-            transform = ART_TRANSFORM
-            region_label = 'art crop'
-        else:
-            region = extract_whole_card(card_img)
-            db_p, db_d = self.whole_phash, self.whole_dhash
-            emb_db = self.whole_emb
-            reranker_model = self.whole_reranker
-            transform = WHOLE_TRANSFORM
-            region_label = 'whole card'
-
-        # Stage 4: hash retrieval
+        # Retrieval over the full database, both orientations, each route
         t0 = time.perf_counter()
-        q_p = phash_64(region)
-        q_d = dhash_64(region)
-        d_p = hamming_distance_vectorized(q_p, db_p)
-        d_d = hamming_distance_vectorized(q_d, db_d)
-        combined = d_p + d_d
+        hyps = []  # (rot, route, prior array, hash dist array, region)
+        for route in routes:
+            extractor, db_p, db_d, emb_db, model, transform, _ = self._route(route)
+            regions, tensors = [], []
+            for rot in (0, 180):
+                img = clean if rot == 0 else np.ascontiguousarray(clean[::-1, ::-1])
+                region = extractor(img)
+                regions.append((rot, img, region))
+                tensors.append(transform(Image.fromarray(region)))
+            with torch.no_grad():
+                q = model(torch.stack(tensors).to(DEVICE)).cpu().numpy()
+            q = q / np.clip(np.linalg.norm(q, axis=1, keepdims=True), 1e-8, None)
+            sims_all = np.clip(q @ emb_db.T, -1.0, 1.0)  # (2, N)
+            for k, (rot, img, region) in enumerate(regions):
+                dist = (hamming_distance_vectorized(phash_64(region), db_p)
+                        + hamming_distance_vectorized(dhash_64(region), db_d))
+                sims = sims_all[k]
+                prior = 0.7 * np.clip(sims, 0, 1) + 0.3 * (1.0 - dist / 128.0)
+                hyps.append({'rot': rot, 'route': route, 'img': img, 'region': region,
+                             'prior': prior, 'dist': dist, 'sims': sims})
+        timings['retrieve_ms'] = (time.perf_counter() - t0) * 1000
 
-        # Test-time augmentation: if top-1 distance is poor, try rotations
-        # The detector sometimes gets orientation wrong on full-art/heavily rotated cards
-        best_distance = combined.min()
-        if best_distance > 10:  # Only if initial result is uncertain
-            for angle in [90, 180, 270]:
-                rotated_img = np.rot90(card_img, k=angle // 90)
-                if frame_class == 'modern':
-                    rot_region = extract_art_crop(rotated_img)
-                else:
-                    rot_region = extract_whole_card(rotated_img)
+        # Candidate pool: best by fused prior, plus the best pure-hash and
+        # pure-embedding hits of each hypothesis
+        pool = {}
+        for h_i, h in enumerate(hyps):
+            k = min(n_candidates, len(h['prior']) - 1)
+            picks = set(np.argpartition(-h['prior'], k)[:n_candidates].tolist())
+            kk = min(10, len(h['dist']) - 1)
+            picks |= set(np.argpartition(h['dist'], kk)[:10].tolist())
+            picks |= set(np.argpartition(-h['sims'], kk)[:10].tolist())
+            for pos in picks:
+                key = (pos, h['rot'])
+                p = float(h['prior'][pos])
+                if key not in pool or p > pool[key][0]:
+                    pool[key] = (p, h_i)
+        ranked = sorted(((p, pos, rot, h_i) for (pos, rot), (p, h_i) in pool.items()),
+                        key=lambda t: -t[0])
 
-                rot_p = phash_64(rot_region)
-                rot_d = dhash_64(rot_region)
-                rot_d_p = hamming_distance_vectorized(rot_p, db_p)
-                rot_d_d = hamming_distance_vectorized(rot_d, db_d)
-                rot_combined = rot_d_p + rot_d_d
-                rot_min = rot_combined.min()
+        # Fast path: hash decisively agrees with the embedding, skip verification
+        best_h = hyps[ranked[0][3]]
+        d_sorted = np.partition(best_h['dist'], 1)[:2]
+        decisive = (d_sorted[0] <= 4 and d_sorted[1] - d_sorted[0] >= 8
+                    and int(np.argmin(best_h['dist'])) == ranked[0][1])
 
-                if rot_min < best_distance:
-                    best_distance = rot_min
-                    combined = rot_combined
-                    region = rot_region
-                    card_img = rotated_img
-
-        k = min(hash_candidates, len(combined) - 1)
-        cand_pos = np.argpartition(combined, k)[:hash_candidates]
-        cand_pos = cand_pos[np.argsort(combined[cand_pos])]
-        cand_card_idx = self.db_indices[cand_pos]
-        sorted_combined = combined[cand_pos]
-        timings['hash_ms'] = (time.perf_counter() - t0) * 1000
-
-        # Fast path: if pHash is decisive, skip the re-ranker
-        gap = sorted_combined[1] - sorted_combined[0] if len(sorted_combined) > 1 else 0
-        fast_path = sorted_combined[0] <= 4 and gap >= 8
-
-        if fast_path:
-            top = [(int(cand_card_idx[i]),
-                    float(1.0 / (1 + sorted_combined[i])),
-                    int(sorted_combined[i]))
-                   for i in range(min(top_k, len(cand_card_idx)))]
-            timings['rerank_ms'] = 0.0
-            timings['set_ms'] = 0.0
-            timings['ocr_ms'] = 0.0
-            timings['total_ms'] = sum(timings.values())
-            return {
-                'top_k': top,
-                'predicted_frame': frame_class,
-                'detection_route': route,
-                'pipeline_route': 'fast_hash',
-                'region_label': region_label,
-                'ocr_title': None,
-                'set_predictions': [],
-                'timings': timings,
-                'card_image': card_img,
-                'region_image': region,
-            }
-
-        # Stage 5: re-rank with the right model
+        # Verification
         t0 = time.perf_counter()
-        with torch.no_grad():
-            t = transform(Image.fromarray(region)).unsqueeze(0).to(DEVICE)
-            q_emb = reranker_model(t).cpu().numpy()
-        q_emb = q_emb / np.clip(np.linalg.norm(q_emb, axis=1, keepdims=True), 1e-8, None)
-        sims = (q_emb @ emb_db[cand_pos].T).flatten()
-        sims = np.clip(sims, -1.0, 1.0)  # guard against float32 drift
-        order = np.argsort(sims)[::-1]
-        ranked_card_idx = cand_card_idx[order]
-        ranked_sims = sims[order]
-        ranked_hash = sorted_combined[order]
-        timings['rerank_ms'] = (time.perf_counter() - t0) * 1000
+        scored = []
+        query = None
+        if self.verify and not decisive:
+            query = self.verifier.prepare_query(clean, glare)
+        for rank, (p, pos, rot, h_i) in enumerate(ranked):
+            v = {}
+            if query is not None and rank < n_verify:
+                v = self.verifier.score(query, pos, rotate180=(rot == 180))
+                total = fuse(p, v['verify'], w_verify=0.5)
+            else:
+                total = fuse(p, 0.0, w_verify=0.5) if query is not None else p
+            scored.append([total, pos, rot, h_i, v])
+        scored.sort(key=lambda t: -t[0])
+        timings['verify_ms'] = (time.perf_counter() - t0) * 1000
 
-        # Stage 6: tie-breakers (only if margin is tight, modern only)
-        timings['set_ms'] = 0.0
-        timings['ocr_ms'] = 0.0
+        top_h = hyps[scored[0][3]]
+        effective_frame = top_h['route']
+        card_oriented = top_h['img']
+
+        # Tie-breakers for modern frames: set symbol, then OCR
         set_predictions: List[str] = []
         ocr_title = None
-
-        if frame_class == 'modern' and len(ranked_sims) > 1:
-            margin = ranked_sims[0] - ranked_sims[1]
-
+        if effective_frame == 'modern' and len(scored) > 1:
+            margin = self._name_margin(scored)
             if margin < 0.05 and self.set_clf is not None:
                 t0 = time.perf_counter()
-                set_predictions = self._classify_set(card_img, top_k=10)
+                set_predictions = self._classify_set(card_oriented, top_k=10)
                 timings['set_ms'] = (time.perf_counter() - t0) * 1000
                 if set_predictions:
-                    set_set = set(set_predictions)
-                    boost = np.array([
-                        0.10 if self.cards[int(ci)].get('set') in set_set else 0.0
-                        for ci in ranked_card_idx
-                    ])
-                    ranked_sims = ranked_sims + boost
-                    order2 = np.argsort(ranked_sims)[::-1]
-                    ranked_card_idx = ranked_card_idx[order2]
-                    ranked_sims = ranked_sims[order2]
-                    ranked_hash = ranked_hash[order2]
-
-            # Re-check margin after set boost - if still tight, fire OCR
-            margin = ranked_sims[0] - ranked_sims[1] if len(ranked_sims) > 1 else 1.0
+                    ss = set(set_predictions)
+                    for row in scored:
+                        if self.cards[int(self.db_indices[row[1]])].get('set') in ss:
+                            row[0] += 0.05
+                    scored.sort(key=lambda t: -t[0])
+            margin = self._name_margin(scored)
             if use_ocr and margin < 0.05 and self.title_ocr is not None:
                 t0 = time.perf_counter()
-                ocr_cands, ocr_title = self.title_ocr.candidates(card_img, top_k=20)
+                ocr_cands, ocr_title = self.title_ocr.candidates(card_oriented, top_k=20)
                 timings['ocr_ms'] = (time.perf_counter() - t0) * 1000
                 if ocr_cands:
-                    ocr_set = set(ocr_cands)
-                    boost = np.array([
-                        0.10 if int(ci) in ocr_set else 0.0
-                        for ci in ranked_card_idx
-                    ])
-                    ranked_sims = ranked_sims + boost
-                    order2 = np.argsort(ranked_sims)[::-1]
-                    ranked_card_idx = ranked_card_idx[order2]
-                    ranked_sims = ranked_sims[order2]
-                    ranked_hash = ranked_hash[order2]
+                    oc = set(ocr_cands)
+                    for row in scored:
+                        if int(self.db_indices[row[1]]) in oc:
+                            row[0] += 0.10
+                    scored.sort(key=lambda t: -t[0])
 
-        timings['total_ms'] = sum(timings.values())
-        top = [(int(ranked_card_idx[i]), float(ranked_sims[i]), int(ranked_hash[i]))
-               for i in range(min(top_k, len(ranked_card_idx)))]
+        top = []
+        seen = set()
+        for total, pos, rot, h_i, v in scored:
+            ci = int(self.db_indices[pos])
+            if ci in seen:
+                continue
+            seen.add(ci)
+            top.append((ci, float(total), int(hyps[h_i]['dist'][pos])))
+            if len(top) >= top_k:
+                break
         return {
             'top_k': top,
+            'confidence': float(scored[0][0]),
+            'margin': float(self._name_margin(scored)),
+            'rotate180': scored[0][2] == 180,
             'predicted_frame': frame_class,
-            'detection_route': route,
-            'pipeline_route': 'rerank',
-            'region_label': region_label,
+            'frame_confidence': frame_conf,
+            'effective_frame': effective_frame,
+            'region_label': self._route(effective_frame)[-1],
+            'pipeline_route': 'fast_hash' if decisive else ('verified' if query is not None else 'rerank'),
+            'verification': scored[0][4],
+            'glare_fraction': float((glare > 0).mean()),
             'ocr_title': ocr_title,
             'set_predictions': set_predictions,
-            'timings': timings,
-            'card_image': card_img,
-            'region_image': region,
+            'timings': dict(timings),
+            'card_image': card_oriented,
+            'region_image': top_h['region'],
         }
+
+    def _name_margin(self, scored) -> float:
+        """Score gap between the top candidate and the best candidate with a
+        *different name* (reprints of the same card aren't competition)."""
+        top_name = self.db_names[scored[0][1]]
+        for row in scored[1:]:
+            if self.db_names[row[1]] != top_name:
+                return scored[0][0] - row[0]
+        return scored[0][0]
+
+    def identify_quad(self, rgb: np.ndarray, cq: CardQuad, top_k: int = 5,
+                      use_ocr: bool = True, confident: float = 0.55,
+                      confident_margin: float = 0.08) -> dict:
+        """Try the outline variants of one detection; keep the best match."""
+        best = None
+        for label, corners in quad_variants(cq):
+            card = warp_quad(rgb, corners)
+            res = self.identify_card_image(card, top_k=top_k, use_ocr=use_ocr)
+            res['variant'] = label
+            res['corners'] = np.roll(corners, 2, axis=0) if res['rotate180'] else corners
+            res['detection_score'] = cq.score
+            res['detection_source'] = cq.source
+            if best is None or res['confidence'] > best['confidence']:
+                best = res
+            if best['confidence'] >= confident and best['margin'] >= confident_margin:
+                break
+        return best
+
+    # -- public API ----------------------------------------------------------
+
+    @staticmethod
+    def load_image(image_path) -> np.ndarray:
+        return np.array(ImageOps.exif_transpose(Image.open(image_path)).convert('RGB'))
+
+    def identify_all(self, image, top_k: int = 5, use_ocr: bool = True,
+                     max_cards: Optional[int] = None) -> List[dict]:
+        """Every confidently identified card in the photo, best first."""
+        rgb = self.load_image(image) if not isinstance(image, np.ndarray) else image
+        t0 = time.perf_counter()
+        quads = self.detector.detect(rgb, max_cards=max_cards)
+        detect_ms = (time.perf_counter() - t0) * 1000
+        results = []
+        for cq in quads:
+            res = self.identify_quad(rgb, cq, top_k=top_k, use_ocr=use_ocr)
+            res['timings']['detect_ms'] = detect_ms / max(len(quads), 1)
+            res['timings']['total_ms'] = sum(res['timings'].values())
+            res['detection_route'] = cq.source
+            if res['confidence'] >= ACCEPT_SCORE and res['margin'] >= ACCEPT_MARGIN:
+                results.append(res)
+        return sorted(results, key=lambda r: -r['confidence'])
+
+    def identify(self, image_path, top_k: int = 5, hash_candidates: int = 500,
+                 use_ocr: bool = True, max_detections: int = 3):
+        """
+        Single-card API (backwards compatible): the most confident card in
+        the photo. The top few detections are all identified and the best
+        *match* wins, so a card-shaped distraction that happens to score
+        highest as a detection doesn't hijack the result.
+        """
+        rgb = self.load_image(image_path) if not isinstance(image_path, np.ndarray) else image_path
+        t0 = time.perf_counter()
+        quads = self.detector.detect(rgb)
+        detect_ms = (time.perf_counter() - t0) * 1000
+        # Prefer large, central detections for single-card photos
+        H, W = rgb.shape[:2]
+
+        def prior(q):
+            c = q.corners.mean(axis=0)
+            off = np.hypot((c[0] - W / 2) / W, (c[1] - H / 2) / H)
+            return q.score + 0.3 * np.sqrt(q.area / (H * W)) - 0.3 * off
+        quads = sorted(quads, key=lambda q: -prior(q))[:max_detections]
+        best = None
+        for cq in quads:
+            res = self.identify_quad(rgb, cq, top_k=top_k, use_ocr=use_ocr)
+            res['detection_route'] = cq.source
+            if best is None or res['confidence'] > best['confidence']:
+                best = res
+        best['timings']['detect_ms'] = detect_ms
+        best['timings']['total_ms'] = sum(v for k, v in best['timings'].items() if k != 'total_ms')
+        best['n_cards_detected'] = len(quads)
+        return best
 
 
 # ---------------------------------------------------------------------------
 # Display
 
-def display_result(image_path, result, cards):
+def _describe(result, cards) -> List[str]:
+    top = result['top_k']
+    c = cards[top[0][0]]
+    lines = [f"PREDICTION: {c['name']}"]
+    if 'set_name' in c:
+        lines.append(f"  Set:           {c.get('set_name', '?')} ({c.get('set', '?').upper()})")
+    if 'collector_number' in c:
+        lines.append(f"  Collector:     #{c.get('collector_number', '?')}")
+    if 'type_line' in c:
+        lines.append(f"  Type:          {c.get('type_line', '?')}")
+    if c.get('mana_cost'):
+        lines.append(f"  Mana cost:     {c.get('mana_cost')}")
+    lines.append(f"  Confidence:    {result['confidence']:.3f}  (margin {result['margin']:.3f})")
+    lines.append(f"  Frame class:   {result['predicted_frame']} ({result['frame_confidence']:.2f})"
+                 f" -> route via {result['region_label']}")
+    lines.append(f"  Detection:     {result.get('detection_route', '?')} / outline {result.get('variant', '?')}"
+                 f"{'  (card upside down)' if result.get('rotate180') else ''}")
+    lines.append(f"  Pipeline:      {result['pipeline_route']}")
+    if result.get('glare_fraction', 0) > 0.01:
+        lines.append(f"  Glare:         {result['glare_fraction'] * 100:.0f}% of card inpainted")
+    v = result.get('verification') or {}
+    if v:
+        lines.append(f"  Verification:  {v.get('art_inliers', 0)} art / {v.get('inliers', 0)} total "
+                     f"keypoint matches, correlation {v.get('corr', 0):.2f}")
+    if result['set_predictions']:
+        lines.append(f"  Set predict:   {', '.join(result['set_predictions'][:5])}")
+    if result.get('ocr_title'):
+        lines.append(f"  OCR title:     '{result['ocr_title']}'")
+    return lines
+
+
+def display_result(image_path, result, cards, show: bool = True):
     top = result['top_k']
     timings = result['timings']
-    route = result['pipeline_route']
-    frame_class = result['predicted_frame']
-
-    if route == 'fast_hash':
-        confidence = f"hash distance {top[0][2]} (lower = better)"
-    else:
-        confidence = f"similarity {top[0][1]:.3f}"
-
-    top1_card = cards[top[0][0]]
-
     print()
     print("=" * 78)
-    print(f"PREDICTION: {top1_card['name']}")
+    for line in _describe(result, cards):
+        print(line)
     print("=" * 78)
-    if 'set_name' in top1_card:
-        print(f"  Set:           {top1_card.get('set_name', '?')} "
-              f"({top1_card.get('set', '?').upper()})")
-    if 'collector_number' in top1_card:
-        print(f"  Collector:     #{top1_card.get('collector_number', '?')}")
-    if 'type_line' in top1_card:
-        print(f"  Type:          {top1_card.get('type_line', '?')}")
-    if 'mana_cost' in top1_card and top1_card.get('mana_cost'):
-        print(f"  Mana cost:     {top1_card.get('mana_cost')}")
-    print(f"  Confidence:    {confidence}")
-    print(f"  Frame class:   {frame_class}  (route via {result['region_label']})")
-    print(f"  Detection:     {result['detection_route']}")
-    print(f"  Pipeline:      {route}")
-    if result['set_predictions']:
-        print(f"  Set predict:   {', '.join(result['set_predictions'][:5])}")
-    if result.get('ocr_title'):
-        print(f"  OCR title:     '{result['ocr_title']}'")
-    print()
     print(f"Top-{len(top)}:")
     for rank, (idx, score, hash_d) in enumerate(top, 1):
-        print(f"  {rank}. {cards[idx]['name']:<40} sim={score:.4f}  hash_d={hash_d}")
+        c = cards[idx]
+        print(f"  {rank}. {c['name']:<40} {c.get('set', ''):>6}  score={score:.4f}  hash_d={hash_d}")
     print()
     print("Timing:")
-    for k in ['detect_ms', 'frame_ms', 'hash_ms', 'rerank_ms', 'set_ms', 'ocr_ms', 'total_ms']:
-        if k in timings:
-            print(f"  {k:<14} {timings[k]:>6.1f}ms")
+    for k, v in timings.items():
+        print(f"  {k:<14} {v:>7.1f}ms")
     print("=" * 78)
+    if not show:
+        return
 
-    # Visualization
     fig, axes = plt.subplots(2, 3, figsize=(13, 8))
-
-    query_img = ImageOps.exif_transpose(Image.open(image_path))
-    axes[0, 0].imshow(query_img)
+    query_img = MultiRegionIdentifier.load_image(image_path)
+    q = CardQuad(result['corners'], result['confidence'], result.get('detection_route', ''))
+    axes[0, 0].imshow(draw_quads(query_img, [q], labels=[cards[top[0][0]]['name']]))
     axes[0, 0].set_title("Query image", fontsize=10)
     axes[0, 0].axis('off')
 
     axes[0, 1].imshow(result['card_image'])
-    axes[0, 1].set_title(f"After detection ({result['detection_route']})", fontsize=10)
+    axes[0, 1].set_title(f"Rectified ({result.get('variant', '')})", fontsize=10)
     axes[0, 1].axis('off')
 
     axes[0, 2].imshow(result['region_image'])
-    axes[0, 2].set_title(f"{result['region_label']} ({frame_class})", fontsize=10)
+    axes[0, 2].set_title(f"{result['region_label']} ({result['effective_frame']})", fontsize=10)
     axes[0, 2].axis('off')
 
     for i in range(3):
@@ -523,7 +647,7 @@ def display_result(image_path, result, cards):
                 color = 'green' if i == 0 else 'gray'
                 axes[1, i].set_title(
                     f"#{i+1}: {cards[idx]['name'][:30]}\n"
-                    f"sim={score:.3f}  hash_d={hash_d}",
+                    f"score={score:.3f}  hash_d={hash_d}",
                     fontsize=9, color=color,
                 )
             else:
@@ -531,10 +655,37 @@ def display_result(image_path, result, cards):
                 axes[1, i].set_title(f"#{i+1}: {cards[idx]['name'][:30]}", fontsize=9)
         axes[1, i].axis('off')
 
-    plt.suptitle(f"Predicted: {top1_card['name']}  ({timings['total_ms']:.0f}ms, {frame_class})",
+    plt.suptitle(f"Predicted: {cards[top[0][0]]['name']}  ({timings.get('total_ms', 0):.0f}ms)",
                  fontsize=13, fontweight='bold')
     plt.tight_layout()
     plt.show()
+
+
+def display_all(image_path, results, cards, show: bool = True, output_path: Optional[Path] = None):
+    print()
+    print("=" * 78)
+    print(f"{len(results)} card(s) identified in {Path(str(image_path)).name}")
+    print("=" * 78)
+    for i, r in enumerate(results, 1):
+        c = cards[r['top_k'][0][0]]
+        print(f"  {i:>2}. {c['name']:<40} {c.get('set', '').upper():>6}  "
+              f"conf={r['confidence']:.3f}  margin={r['margin']:.3f}")
+    if not (show or output_path):
+        return
+    rgb = MultiRegionIdentifier.load_image(image_path)
+    quads = [CardQuad(r['corners'], r['confidence'], '') for r in results]
+    labels = [cards[r['top_k'][0][0]]['name'] for r in results]
+    vis = draw_quads(rgb, quads, labels=labels)
+    fig = plt.figure(figsize=(12, 9))
+    plt.imshow(vis)
+    plt.axis('off')
+    plt.title(f"{len(results)} card(s)")
+    plt.tight_layout()
+    if output_path is not None:
+        fig.savefig(output_path, dpi=120, bbox_inches='tight')
+    if show:
+        plt.show()
+    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +740,15 @@ def _check_artifacts():
         sys.exit(1)
 
 
-def load_everything(verbose: bool = True):
+def _load_embeddings(path: Path) -> np.ndarray:
+    emb = np.load(path).astype(np.float32)
+    # Re-normalise: guards against float32 drift between training-time and
+    # inference-time normalisation (similarities > 1.0)
+    return emb / np.clip(np.linalg.norm(emb, axis=1, keepdims=True), 1e-8, None)
+
+
+def load_everything(verbose: bool = True, use_parallel: bool = True, verify: bool = True,
+                    use_ocr: bool = True, use_yolo: bool = True):
     if verbose:
         print(f"Device: {DEVICE}")
         print("Loading metadata, hash DB, models, embeddings...")
@@ -599,9 +758,9 @@ def load_everything(verbose: bool = True):
     with open(METADATA_PATH, 'r', encoding='utf-8') as f:
         cards = json.load(f)
 
-    db = np.load(HASH_DB_PATH)
+    db = dict(np.load(HASH_DB_PATH))
     required_keys = ['indices', 'art_phash', 'art_dhash', 'whole_phash', 'whole_dhash']
-    missing = [k for k in required_keys if k not in db.files]
+    missing = [k for k in required_keys if k not in db]
     if missing:
         print(f"ERROR: hash DB missing keys: {missing}")
         print("  This identifier needs the v2 hash DB. Re-run train_identifier.py")
@@ -612,103 +771,87 @@ def load_everything(verbose: bool = True):
         print(f"  Cards: {len(cards):,}")
         print(f"  Hash DB: {len(db['indices']):,} entries (art + whole)")
 
-    # Frame classifier
     frame_clf = FrameClassifier(n_classes=len(FRAME_CLASSES)).to(DEVICE)
-    frame_clf.load_state_dict(torch.load(FRAME_CLF_PATH, map_location=DEVICE))
+    frame_clf.load_state_dict(torch.load(FRAME_CLF_PATH, map_location=DEVICE, weights_only=True))
     frame_clf.eval()
     if verbose:
         print(f"  Frame classifier loaded")
 
-    # Art re-ranker
     art_reranker = MobileNetReranker(EMBEDDING_DIM).to(DEVICE)
-    art_reranker.load_state_dict(torch.load(ART_RERANKER_PATH, map_location=DEVICE))
+    art_reranker.load_state_dict(torch.load(ART_RERANKER_PATH, map_location=DEVICE, weights_only=True))
     art_reranker.eval()
-    art_emb = np.load(ART_EMB_PATH)
-    # Ensure stored embeddings are L2-normalized (fixes similarity > 1.0 bug
-    # caused by float32 drift between training-time and inference-time normalization)
-    norms = np.linalg.norm(art_emb, axis=1, keepdims=True)
-    norms = np.clip(norms, 1e-8, None)
-    art_emb = art_emb / norms
-    if verbose:
-        print(f"  Art re-ranker loaded ({art_emb.shape} embeddings, re-normalized)")
-
-    # Whole-card re-ranker
+    art_emb = _load_embeddings(ART_EMB_PATH)
     whole_reranker = MobileNetReranker(EMBEDDING_DIM).to(DEVICE)
-    whole_reranker.load_state_dict(torch.load(WHOLE_RERANKER_PATH, map_location=DEVICE))
+    whole_reranker.load_state_dict(torch.load(WHOLE_RERANKER_PATH, map_location=DEVICE, weights_only=True))
     whole_reranker.eval()
-    whole_emb = np.load(WHOLE_EMB_PATH)
-    norms = np.linalg.norm(whole_emb, axis=1, keepdims=True)
-    norms = np.clip(norms, 1e-8, None)
-    whole_emb = whole_emb / norms
+    whole_emb = _load_embeddings(WHOLE_EMB_PATH)
+    for name, emb in (('art', art_emb), ('whole-card', whole_emb)):
+        if len(emb) != len(db['indices']):
+            print(f"ERROR: {name} embeddings ({len(emb)}) don't match the hash DB "
+                  f"({len(db['indices'])}). Re-run: python train_identifier.py --skip-train")
+            sys.exit(1)
     if verbose:
-        print(f"  Whole-card re-ranker loaded ({whole_emb.shape} embeddings, re-normalized)")
+        print(f"  Re-rankers loaded (art {art_emb.shape}, whole {whole_emb.shape})")
 
-    # Set symbol classifier (optional - skip if not trained)
     set_clf = None
     set_codes: List[str] = []
     if SET_CLF_PATH.exists() and SET_CODES_PATH.exists():
         with open(SET_CODES_PATH) as f:
             set_codes = json.load(f)
         set_clf = SetSymbolClassifier(n_classes=len(set_codes)).to(DEVICE)
-        set_clf.load_state_dict(torch.load(SET_CLF_PATH, map_location=DEVICE))
+        set_clf.load_state_dict(torch.load(SET_CLF_PATH, map_location=DEVICE, weights_only=True))
         set_clf.eval()
         if verbose:
             print(f"  Set classifier loaded ({len(set_codes)} sets)")
     elif verbose:
         print(f"  Set classifier not found - tie-break will use OCR only")
 
-    # Detector
-    detector = CardDetector(weights_path=YOLO_BEST, verbose=verbose)
+    detector = CardDetector(weights_path=YOLO_BEST, verbose=verbose, use_yolo=use_yolo)
 
-    # OCR (lazy, optional)
     title_ocr = None
-    try:
-        if verbose:
-            print("Loading OCR (this can take 10-20s on first run)...")
-        title_ocr = TitleOCR([c['name'] for c in cards])
-        if verbose:
-            print("  OCR ready")
-    except Exception as e:
-        if verbose:
-            print(f"  OCR unavailable ({e}). Pipeline will skip OCR confirmation.")
+    if use_ocr:
+        try:
+            if verbose:
+                print("Loading OCR (this can take 10-20s on first run)...")
+            title_ocr = TitleOCR([c['name'] for c in cards])
+            if verbose:
+                print("  OCR ready")
+        except Exception as e:
+            if verbose:
+                print(f"  OCR unavailable ({e}). Pipeline will skip OCR confirmation.")
 
     pipeline = MultiRegionIdentifier(
         cards, db, frame_clf, art_reranker, art_emb,
         whole_reranker, whole_emb, set_clf, set_codes,
-        detector, title_ocr,
+        detector, title_ocr, use_parallel=use_parallel, verify=verify,
     )
     return cards, pipeline
 
 
 def save_result_figure(image_path, result, cards, output_path):
-    """Save a comparison figure (original, cropped, predicted) to output_path."""
+    """Save a comparison figure (original, rectified, predicted) to output_path."""
     top = result['top_k']
-    frame_class = result['predicted_frame']
-    timings = result['timings']
     top1_card = cards[top[0][0]]
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-
-    # Original image
-    query_img = ImageOps.exif_transpose(Image.open(image_path))
-    axes[0].imshow(query_img)
+    query_img = MultiRegionIdentifier.load_image(image_path)
+    q = CardQuad(result['corners'], result['confidence'], '')
+    axes[0].imshow(draw_quads(query_img, [q], labels=[top1_card['name']]))
     axes[0].set_title("Original", fontsize=11)
     axes[0].axis('off')
 
-    # Cropped / detected card
     axes[1].imshow(result['card_image'])
-    axes[1].set_title(f"Cropped ({result['detection_route']})", fontsize=11)
+    axes[1].set_title(f"Rectified ({result.get('detection_route', '')}, {result.get('variant', '')})",
+                      fontsize=11)
     axes[1].axis('off')
 
-    # Predicted card from database
-    pred_idx = top[0][0]
-    match_path = IMAGE_DIR / f"{cards[pred_idx]['id']}.jpg"
+    match_path = IMAGE_DIR / f"{top1_card['id']}.jpg"
     if match_path.exists():
         axes[2].imshow(Image.open(match_path))
     else:
         axes[2].text(0.5, 0.5, "image\nnot found", ha='center', va='center')
-    score_str = f"hash_d={top[0][2]}" if result['pipeline_route'] == 'fast_hash' else f"sim={top[0][1]:.3f}"
-    axes[2].set_title(f"Predicted: {top1_card['name'][:35]}\n{score_str}", fontsize=10)
+    axes[2].set_title(f"Predicted: {top1_card['name'][:35]}\n"
+                      f"confidence={result['confidence']:.3f} margin={result['margin']:.3f}", fontsize=10)
     axes[2].axis('off')
 
     plt.suptitle(f"{Path(image_path).name}  →  {top1_card['name']}",
@@ -718,23 +861,29 @@ def save_result_figure(image_path, result, cards, output_path):
     plt.close(fig)
 
 
-def run_one(pipeline, cards, image_path: str, use_ocr: bool = True):
+def run_one(pipeline, cards, image_path: str, use_ocr: bool = True, all_cards: bool = False,
+            show: bool = True):
     if not Path(image_path).exists():
         print(f"File not found: {image_path}")
         return False
     try:
-        result = pipeline.identify(image_path, top_k=5, use_ocr=use_ocr)
+        if all_cards:
+            results = pipeline.identify_all(image_path, top_k=5, use_ocr=use_ocr)
+            display_all(image_path, results, cards, show=show)
+        else:
+            result = pipeline.identify(image_path, top_k=5, use_ocr=use_ocr)
+            display_result(image_path, result, cards, show=show)
     except Exception as e:
         print(f"Error during identification: {e}")
         import traceback
         traceback.print_exc()
         return False
-    display_result(image_path, result, cards)
     return True
 
 
-def run_batch(pipeline, cards, input_dir: Path, output_dir: Path, use_ocr: bool = True):
-    """Process all images in input_dir, save comparison graphs to output_dir."""
+def run_batch(pipeline, cards, input_dir: Path, output_dir: Path, use_ocr: bool = True,
+              all_cards: bool = False):
+    """Process all images in input_dir, save result figures to output_dir."""
     extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
     image_files = sorted(
         p for p in input_dir.iterdir()
@@ -748,49 +897,75 @@ def run_batch(pipeline, cards, input_dir: Path, output_dir: Path, use_ocr: bool 
     print(f"\nProcessing {len(image_files)} images from {input_dir}")
     print(f"Saving results to {output_dir}\n")
 
+    summary = []
     for i, img_path in enumerate(image_files, 1):
         print(f"[{i}/{len(image_files)}] {img_path.name} ... ", end='', flush=True)
         try:
-            result = pipeline.identify(str(img_path), top_k=5, use_ocr=use_ocr)
-            top1_name = cards[result['top_k'][0][0]]['name']
             out_name = f"{img_path.stem}_result.png"
-            save_result_figure(str(img_path), result, cards, output_dir / out_name)
-            print(f"→ {top1_name}")
+            if all_cards:
+                results = pipeline.identify_all(str(img_path), top_k=5, use_ocr=use_ocr)
+                names = [cards[r['top_k'][0][0]]['name'] for r in results]
+                display_all(str(img_path), results, cards, show=False, output_path=output_dir / out_name)
+                print(f"→ {len(names)} card(s): {', '.join(names)}")
+                summary.append({'file': img_path.name, 'cards': names})
+            else:
+                result = pipeline.identify(str(img_path), top_k=5, use_ocr=use_ocr)
+                top1_name = cards[result['top_k'][0][0]]['name']
+                save_result_figure(str(img_path), result, cards, output_dir / out_name)
+                print(f"→ {top1_name}  (conf {result['confidence']:.2f})")
+                summary.append({'file': img_path.name, 'card': top1_name,
+                                'confidence': round(result['confidence'], 4),
+                                'margin': round(result['margin'], 4)})
         except Exception as e:
             print(f"ERROR: {e}")
 
+    (output_dir / 'results.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     print(f"\nDone! {len(image_files)} results saved to {output_dir}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Identify an MTG card from an image")
+    parser = argparse.ArgumentParser(description="Identify MTG cards in a photo")
     parser.add_argument('image', nargs='?', help="Path to a card image (optional)")
     parser.add_argument('--batch', type=str, default=None,
                         help="Process all images in this folder")
     parser.add_argument('--output', type=str, default=None,
                         help="Output folder for batch results (default: <batch>_results)")
+    parser.add_argument('--all', action='store_true',
+                        help="Identify every card in the photo, not just the main one")
     parser.add_argument('--no-gui', action='store_true',
                         help="Force stdin input instead of file picker")
     parser.add_argument('--once', action='store_true',
                         help="Identify one image and exit")
     parser.add_argument('--no-ocr', action='store_true',
-                        help="Skip OCR even when re-ranker is unsure")
+                        help="Skip OCR even when the match is a close call")
+    parser.add_argument('--no-parallel', action='store_true',
+                        help="Trust the frame classifier even when it's unsure")
+    parser.add_argument('--fast', action='store_true',
+                        help="Skip local-feature verification (faster, less robust to glare)")
+    parser.add_argument('--no-yolo', action='store_true',
+                        help="Use only the classical card detector")
     args = parser.parse_args()
 
-    cards, pipeline = load_everything()
     use_ocr = not args.no_ocr
+    batch = args.batch
+    if not batch and not args.image and DEFAULT_BATCH_FOLDER.is_dir():
+        batch = str(DEFAULT_BATCH_FOLDER)
+        use_ocr = False
 
-    if args.batch:
-        input_dir = Path(args.batch)
+    cards, pipeline = load_everything(use_parallel=not args.no_parallel, verify=not args.fast,
+                                      use_ocr=use_ocr, use_yolo=not args.no_yolo)
+
+    if batch:
+        input_dir = Path(batch)
         if not input_dir.is_dir():
             print(f"ERROR: {input_dir} is not a directory")
             sys.exit(1)
         output_dir = Path(args.output) if args.output else input_dir.parent / f"{input_dir.name}_results"
-        run_batch(pipeline, cards, input_dir, output_dir, use_ocr=use_ocr)
+        run_batch(pipeline, cards, input_dir, output_dir, use_ocr=use_ocr, all_cards=args.all)
         return
 
     if args.image:
-        run_one(pipeline, cards, args.image, use_ocr=use_ocr)
+        run_one(pipeline, cards, args.image, use_ocr=use_ocr, all_cards=args.all)
         return
 
     print()
@@ -801,7 +976,7 @@ def main():
         if not path:
             print("Goodbye.")
             break
-        if not run_one(pipeline, cards, path, use_ocr=use_ocr):
+        if not run_one(pipeline, cards, path, use_ocr=use_ocr, all_cards=args.all):
             continue
         if args.once:
             break
@@ -809,8 +984,4 @@ def main():
 
 
 if __name__ == '__main__':
-    INPUT_FOLDER = Path(r"C:\Users\Ben Funk\PycharmProjects\DS-Capstone-2\Mtg-Cards")
-    OUTPUT_FOLDER = INPUT_FOLDER.parent / f"{INPUT_FOLDER.name}_results"
-
-    cards, pipeline = load_everything()
-    run_batch(pipeline, cards, INPUT_FOLDER, OUTPUT_FOLDER, use_ocr=False)
+    main()
