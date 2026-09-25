@@ -264,7 +264,8 @@ class LocalFeatureVerifier:
         if img is None:
             feats = (np.zeros((0, 2), np.float32), None, None)
         else:
-            feats = self.features(img)
+            pts, desc, _ = self.features(img)
+            feats = (pts, desc, None)  # don't keep the image: ~50 KB per entry instead of ~400
         self.cache[idx] = feats
         if len(self.cache) > self.cache_size:
             self.cache.popitem(last=False)
@@ -361,7 +362,9 @@ class CandidateVerifier:
     """
 
     def __init__(self, load_reference: Callable[[int], Optional[np.ndarray]],
-                 cache_size: int = 2048):
+                 cache_size: int = 1024):
+        # ~50 KB of keypoints + ~125 KB of correlation features per cached
+        # card, so the default costs ~180 MB at most.
         self.load_reference = load_reference
         self.local = LocalFeatureVerifier(load_reference, cache_size=cache_size)
         self._corr_cache: 'OrderedDict[int, Optional[np.ndarray]]' = OrderedDict()
@@ -376,7 +379,7 @@ class CandidateVerifier:
         if img is not None:
             if img.shape[0] != CARD_H or img.shape[1] != CARD_W:
                 img = cv2.resize(img, (CARD_W, CARD_H), interpolation=cv2.INTER_AREA)
-            feat = correlation_features(img)
+            feat = correlation_features(img).astype(np.float16)  # halves the cache
         self._corr_cache[idx] = feat
         if len(self._corr_cache) > self.cache_size:
             self._corr_cache.popitem(last=False)
@@ -401,6 +404,7 @@ class CandidateVerifier:
         rf = self._ref_corr(idx)
         corr = 0.0
         if rf is not None:
+            rf = rf.astype(np.float32)
             if rotate180:
                 corr = masked_correlation(query['corr180'], rf, query['valid180'])
             else:
