@@ -231,7 +231,7 @@ class LocalFeatureVerifier:
     """
 
     def __init__(self, load_reference: Callable[[int], Optional[np.ndarray]],
-                 n_features: int = 1500, cache_size: int = 2048):
+                 n_features: int = 1000, cache_size: int = 2048):
         self.load_reference = load_reference
         self.orb = cv2.ORB_create(nfeatures=n_features, scaleFactor=1.2, nlevels=6,
                                   edgeThreshold=15, patchSize=31, fastThreshold=10)

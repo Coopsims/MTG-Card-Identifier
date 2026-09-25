@@ -149,9 +149,16 @@ class ReferenceFolderIdentifier:
                 s = self.verifier.score(query, idx, rotate180=rot)
                 scored.append((fuse(prior, s['verify']), idx, rot, s))
 
-        verify_range(0, n_verify)
-        if max(t[3]['verify'] for t in scored) < 0.2:   # weak: look further down
-            verify_range(n_verify, n_verify_max)
+        def settled():
+            best = max(scored, key=lambda t: t[3]['verify'])
+            others = [t[3]['verify'] for t in scored if self.names[t[1]] != self.names[best[1]]]
+            return best[3]['verify'] >= 0.45 and best[3]['verify'] - max(others, default=0) >= 0.2
+
+        verify_range(0, 3)
+        if not settled():
+            verify_range(3, n_verify)
+            if max(t[3]['verify'] for t in scored) < 0.2:   # weak: look further down
+                verify_range(n_verify, n_verify_max)
         scored += [(fuse(prior, 0.0), idx, rot, {}) for prior, idx, rot in pool[len(scored):]]
         scored.sort(key=lambda t: -t[0])
         top_total, top_idx, top_rot, top_s = scored[0]

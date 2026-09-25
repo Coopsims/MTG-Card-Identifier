@@ -57,7 +57,7 @@ from mtg_layout import (
     phash_64, dhash_64, hamming_distance_vectorized,
 )
 from card_detection import (
-    CardQuad, find_card_quads, full_image_quad, warp_quad, draw_quads,
+    CardQuad, find_card_quads, full_image_quad, warp_quad, draw_quads, quad_iou,
 )
 from card_matching import (
     CandidateVerifier, remove_glare, quad_variants, fuse,
@@ -214,8 +214,16 @@ class CardDetector:
         confs = obb.conf.cpu().numpy() if hasattr(obb, 'conf') else np.full(len(corners), 0.5)
         return [c.reshape(4, 2) for c in corners], [float(c) for c in confs]
 
-    def detect(self, image: np.ndarray, max_cards: Optional[int] = None) -> List[CardQuad]:
+    def detect(self, image: np.ndarray, max_cards: Optional[int] = None,
+               yolo_only: bool = False) -> List[CardQuad]:
+        """All cards in the image. yolo_only=True returns just the refined
+        YOLO detections (possibly none) - the cheap first stage of identify()."""
         yq, yc = self.propose(image)
+        if yolo_only:
+            if not yq:
+                return []
+            return find_card_quads(image, extra_quads=yq, extra_scores=yc,
+                                   max_cards=max_cards, use_contours=False)
         quads = find_card_quads(image, extra_quads=yq or None, extra_scores=yc or None,
                                 max_cards=max_cards,
                                 use_contours=self.use_classical or self.model is None)
@@ -431,13 +439,23 @@ class MultiRegionIdentifier:
                 v = self.verifier.score(query, pos, rotate180=(rot == 180))
                 scored.append([fuse(p, v['verify'], w_verify=0.5), pos, rot, h_i, v])
 
+        def settled() -> bool:
+            """A strong verified match that clearly beats every other name
+            verified so far - no need to look further."""
+            best = max(scored, key=lambda r: r[4]['verify'])
+            others = [r[4]['verify'] for r in scored if self.db_names[r[1]] != self.db_names[best[1]]]
+            return best[4]['verify'] >= QUALITY_STRONG and best[4]['verify'] - max(others, default=0) >= 0.2
+
         if query is not None:
-            verify_range(0, n_verify)
-            # Nothing convincing among the first few: a misaligned crop or
-            # heavy glare can push the right card down the retrieval list,
-            # so look further before giving up.
-            if max(r[4]['verify'] for r in scored) < QUALITY_GOOD[0]:
-                verify_range(n_verify, n_verify_max)
+            # Staged: a clear winner usually shows up in the first few
+            verify_range(0, 3)
+            if not settled():
+                verify_range(3, n_verify)
+                # Nothing convincing: a misaligned crop or heavy glare can
+                # push the right card down the retrieval list, so look
+                # further before giving up.
+                if max(r[4]['verify'] for r in scored) < QUALITY_GOOD[0]:
+                    verify_range(n_verify, n_verify_max)
             n_done = len(scored)
             scored += [[fuse(p, 0.0, w_verify=0.5), pos, rot, h_i, {}]
                        for p, pos, rot, h_i in ranked[n_done:]]
@@ -582,26 +600,38 @@ class MultiRegionIdentifier:
         highest as a detection doesn't hijack the result.
         """
         rgb = self.load_image(image_path) if not isinstance(image_path, np.ndarray) else image_path
-        t0 = time.perf_counter()
-        quads = self.detector.detect(rgb)
-        detect_ms = (time.perf_counter() - t0) * 1000
-        # Prefer large, central detections for single-card photos
         H, W = rgb.shape[:2]
 
-        def prior(q):
+        def prior(q):  # prefer large, central detections for single-card photos
             c = q.corners.mean(axis=0)
             off = np.hypot((c[0] - W / 2) / W, (c[1] - H / 2) / H)
             return q.score + 0.3 * np.sqrt(q.area / (H * W)) - 0.3 * off
-        quads = sorted(quads, key=lambda q: -prior(q))[:max_detections]
-        best = None
-        for cq in quads:
-            res = self.identify_quad(rgb, cq, top_k=top_k, use_ocr=use_ocr)
-            res['detection_route'] = cq.source
-            if best is None or res['confidence'] > best['confidence']:
-                best = res
+
+        # Stage 1 (when a fine-tuned YOLO is loaded): YOLO's detections only.
+        # Stage 2, only if that didn't give a strong match: YOLO + classical.
+        staged = self.detector.model is not None and self.detector.use_classical
+        detect_ms = 0.0
+        best, tried, n_detected = None, [], 0
+        for yolo_only in ((True, False) if staged else (False,)):
+            t0 = time.perf_counter()
+            quads = self.detector.detect(rgb, yolo_only=yolo_only)
+            detect_ms += (time.perf_counter() - t0) * 1000
+            n_detected = max(n_detected, len(quads))
+            for cq in sorted(quads, key=lambda q: -prior(q))[:max_detections]:
+                if any(quad_iou(cq.corners, t) > 0.95 for t in tried):
+                    continue
+                tried.append(cq.corners)
+                res = self.identify_quad(rgb, cq, top_k=top_k, use_ocr=use_ocr)
+                res['detection_route'] = cq.source
+                if best is None or res['confidence'] > best['confidence']:
+                    best = res
+                if best['quality'] == 'strong':
+                    break
+            if best is not None and best['quality'] == 'strong':
+                break
         best['timings']['detect_ms'] = detect_ms
         best['timings']['total_ms'] = sum(v for k, v in best['timings'].items() if k != 'total_ms')
-        best['n_cards_detected'] = len(quads)
+        best['n_cards_detected'] = n_detected
         return best
 
 
