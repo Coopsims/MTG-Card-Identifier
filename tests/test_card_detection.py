@@ -5,6 +5,7 @@ import pytest
 from card_detection import (CARD_ASPECT, order_corners_portrait,
                             find_card_quads, quad_iou, rectified_aspect, refine_quad,
                             order_corners_clockwise)
+from card_matching import quad_variants
 from photo_synthesis import camera_homography, rounded_corner_mask
 from mtg_layout import CARD_W, CARD_H
 
@@ -67,7 +68,10 @@ def test_find_card_quads_locates_card(card, kwargs):
     scene, gt = render(card, **kwargs)
     quads = find_card_quads(scene)
     assert quads, "no card found"
-    best = max(quad_iou(q.corners, gt) for q in [quads[0]] + quads[0].alternatives)
+    # One of the outlines the identifier tries for the top detection must be
+    # the card (a black border on a black mat may only yield the inner frame,
+    # which the border-expanded variants cover).
+    best = max(quad_iou(corners, gt) for _, corners in quad_variants(quads[0]))
     assert best > 0.9
 
 

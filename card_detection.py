@@ -360,84 +360,113 @@ def _color_gradient_images(rgb: np.ndarray):
     return gx_out, gy_out
 
 
-def refine_quad(rgb: np.ndarray, quad: np.ndarray, search_frac: float = 0.06,
-                n_samples: int = 48, grads=None, max_shift_frac: float = 0.12) -> np.ndarray:
-    """
-    Snap a rough quad onto the card's real edges.
-
-    For each side we sample points along it, look along the outward normal
-    for the strongest (colour) gradient, and RANSAC-fit a line through the
-    edge points. Among comparable edge responses we prefer the outermost one,
-    because the card's outer edge is the outermost straight edge of the card
-    (inner frame lines are parallel and would otherwise compete).
-
-    Falls back to the input quad if the refinement looks implausible.
-    """
-    q = order_corners_clockwise(quad)
-    gx, gy = grads if grads is not None else _color_gradient_images(rgb)
+def _refine_sides_once(q: np.ndarray, gx: np.ndarray, gy: np.ndarray, search_frac: float,
+                       n_samples: int, rng: np.random.Generator):
+    """One refinement pass: a line per side, or None where no edge was found."""
     h, w = gx.shape
     center = q.mean(axis=0)
     lines = []
-    rng = np.random.default_rng(0)
     for k in range(4):
         a, b = q[k], q[(k + 1) % 4]
         d = b - a
         L = float(np.linalg.norm(d))
         if L < 8:
-            return q
+            return None
         tvec = d / L
         nvec = np.array([-tvec[1], tvec[0]], dtype=np.float32)
         if np.dot((a + b) / 2 - center, nvec) < 0:
             nvec = -nvec
         other = float(np.linalg.norm(q[(k + 2) % 4] - q[(k + 1) % 4]))
-        span = max(4.0, search_frac * max(L, other))
+        span = max(3.0, search_frac * max(L, other))
         offs = np.arange(-span, span + 0.5, 1.0, dtype=np.float32)
         ts = np.linspace(0.1, 0.9, n_samples, dtype=np.float32)
         base = a[None, :] + ts[:, None] * d[None, :]
-        # sample grid: n_samples x len(offs)
-        sx = base[:, 0:1] + offs[None, :] * nvec[0]
-        sy = base[:, 1:2] + offs[None, :] * nvec[1]
-        mx = cv2.remap(gx, sx.astype(np.float32), sy.astype(np.float32), cv2.INTER_LINEAR,
-                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        my = cv2.remap(gy, sx.astype(np.float32), sy.astype(np.float32), cv2.INTER_LINEAR,
-                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        resp = np.abs(mx * nvec[0] + my * nvec[1])
-        # Bias toward the outer side among comparable peaks
-        bias = 1.0 + 0.25 * (offs - offs.min()) / (offs.max() - offs.min() + 1e-6)
-        best = np.argmax(resp * bias[None, :], axis=1)
-        strength = resp[np.arange(len(ts)), best]
-        pts = np.stack([sx[np.arange(len(ts)), best], sy[np.arange(len(ts)), best]], axis=1)
-        inside = (pts[:, 0] >= 0) & (pts[:, 0] < w) & (pts[:, 1] >= 0) & (pts[:, 1] < h)
-        good = inside & (strength > 0.3 * (np.median(strength[inside]) if inside.any() else 0) + 1e-3)
-        if good.sum() < n_samples * 0.3:
+        sx = (base[:, 0:1] + offs[None, :] * nvec[0]).astype(np.float32)
+        sy = (base[:, 1:2] + offs[None, :] * nvec[1]).astype(np.float32)
+        mx = cv2.remap(gx, sx, sy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        my = cv2.remap(gy, sx, sy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        signed = mx * nvec[0] + my * nvec[1]
+        mag = np.abs(signed)
+        inside = (sx >= 0) & (sx < w) & (sy >= 0) & (sy < h)
+        mag = np.where(inside, mag, 0)
+        # every local maximum of the edge response is a candidate edge point
+        peak = np.zeros_like(mag, bool)
+        peak[:, 1:-1] = (mag[:, 1:-1] >= mag[:, :-2]) & (mag[:, 1:-1] >= mag[:, 2:])
+        row_max = mag.max(axis=1)
+        strong_level = 0.35 * float(np.percentile(row_max, 80)) + 1e-3
+        peak &= mag >= strong_level
+        ri, ci = np.nonzero(peak)
+        if len(ri) < n_samples * 0.25:
             lines.append(None)
             continue
-        line, inl = _ransac_line(pts[good], weights=strength[good],
-                                 thresh=max(1.0, 0.006 * L), rng=rng)
-        if line is None or inl.sum() < n_samples * 0.25:
-            lines.append(None)
-            continue
-        lines.append(line)
+        pts = np.stack([sx[ri, ci], sy[ri, ci]], axis=1)
+        # prefer the edge nearest the current side, not the strongest far one
+        prox = np.exp(-(offs[ci] / (0.6 * span)) ** 2)
+        wts = mag[ri, ci] * prox
+        sgn = np.sign(signed[ri, ci])
+        best = None
+        for s in (1.0, -1.0):  # never mix edge polarities in one line
+            sel = sgn == s
+            if sel.sum() < n_samples * 0.25:
+                continue
+            line, inl = _ransac_line(pts[sel], weights=wts[sel], thresh=max(1.0, 0.006 * L), rng=rng)
+            if line is None:
+                continue
+            support = len(np.unique(ri[sel][inl]))   # distinct sample positions
+            score = float(wts[sel][inl].sum())
+            if support >= n_samples * 0.3 and (best is None or score > best[0]):
+                best = (score, line)
+        lines.append(best[1] if best else None)
+    return lines
 
-    # Fall back to the original side for any side we couldn't refine
-    for k in range(4):
-        if lines[k] is None:
-            a, b = q[k], q[(k + 1) % 4]
-            d = (b - a) / (np.linalg.norm(b - a) + 1e-9)
-            lines[k] = np.array([d[0], d[1], a[0], a[1]], dtype=np.float32)
-    new_q = []
-    for k in range(4):
-        p = _line_intersection(lines[k - 1], lines[k])
-        if p is None:
-            return q
-        new_q.append(p)
-    new_q = np.array(new_q, dtype=np.float32)
-    size = max(np.linalg.norm(q[2] - q[0]), np.linalg.norm(q[3] - q[1]))
-    if (not np.all(np.isfinite(new_q))
-            or np.abs(new_q - q).max() > max_shift_frac * size
-            or not quad_angles_ok(new_q)):
-        return q
-    return new_q
+
+def refine_quad(rgb: np.ndarray, quad: np.ndarray, search_frac: float = 0.05,
+                n_samples: int = 48, grads=None, max_shift_frac: float = 0.12,
+                iterations: int = 3) -> np.ndarray:
+    """
+    Snap a rough quad onto the card's real edges.
+
+    For each side we sample points along it, look along the normal for
+    (colour) gradient peaks, and RANSAC-fit a line through them - weighted
+    toward peaks near the current side, and never mixing edge polarities, so
+    a neighbouring card's edge or the card's own inner frame doesn't win.
+    Several passes with a shrinking search band let a rotated rectangle
+    (YOLO-OBB) converge onto a perspective trapezoid.
+
+    Falls back to the input quad if the refinement looks implausible.
+    """
+    q0 = order_corners_clockwise(quad)
+    gx, gy = grads if grads is not None else _color_gradient_images(rgb)
+    rng = np.random.default_rng(0)
+    q = q0.copy()
+    for it in range(iterations):
+        lines = _refine_sides_once(q, gx, gy, search_frac / (1.8 ** it), n_samples, rng)
+        if lines is None:
+            break
+        for k in range(4):  # keep the current side where no edge was found
+            if lines[k] is None:
+                a, b = q[k], q[(k + 1) % 4]
+                d = (b - a) / (np.linalg.norm(b - a) + 1e-9)
+                lines[k] = np.array([d[0], d[1], a[0], a[1]], dtype=np.float32)
+        new_q = []
+        for k in range(4):
+            p = _line_intersection(lines[k - 1], lines[k])
+            if p is None:
+                break
+            new_q.append(p)
+        if len(new_q) < 4:
+            break
+        new_q = np.array(new_q, dtype=np.float32)
+        if not np.all(np.isfinite(new_q)) or not quad_angles_ok(new_q):
+            break
+        moved = np.abs(new_q - q).max()
+        q = new_q
+        if moved < 0.5:
+            break
+    size = max(np.linalg.norm(q0[2] - q0[0]), np.linalg.norm(q0[3] - q0[1]))
+    if np.abs(q - q0).max() > max_shift_frac * size or not quad_angles_ok(q):
+        return q0
+    return q
 
 
 # ---------------------------------------------------------------------------
@@ -809,7 +838,7 @@ def find_card_quads(rgb: np.ndarray, extra_quads: Optional[Sequence[np.ndarray]]
         for i, eq in enumerate(extra_quads):
             conf = float(extra_scores[i]) if extra_scores is not None else 0.5
             q0 = order_corners_clockwise(np.asarray(eq, np.float32) * s)
-            q = refine_quad(work, q0, search_frac=0.06, grads=grads)
+            q = refine_quad(work, q0, search_frac=0.05, grads=grads)
             sc = _score_quad(q, gmag, edge_thresh, work.shape, {})
             if sc is None:
                 continue
