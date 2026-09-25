@@ -651,11 +651,15 @@ def _resolve_candidates(cands: List[dict]) -> List[dict]:
         similar = sum(1 for a in areas if a >= areas[-1] / 2.5) if areas else 0
         if similar >= 2:
             drop.add(j)
-    # Art / text boxes: perpendicular quads inside another quad
+    # Art / text boxes: perpendicular quads inside a card. Only a live,
+    # reasonably card-like outer quad can explain away an inner one - a
+    # weak blob spanning several cards must not swallow them.
     for i in range(n):
         for j in range(n):
-            if i != j and contain[i, j] > 0.85 and kept[i]['area'] < 0.7 * kept[j]['area'] \
-                    and not _same_card_parallel(kept[i], kept[j]):
+            if (i != j and j not in drop and contain[i, j] > 0.85
+                    and kept[i]['area'] < 0.7 * kept[j]['area']
+                    and kept[j]['score'] >= 0.7 * kept[i]['score']
+                    and not _same_card_parallel(kept[i], kept[j])):
                 drop.add(i)
     alive = [i for i in range(n) if i not in drop]
 
